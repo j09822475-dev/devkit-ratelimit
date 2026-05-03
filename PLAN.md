@@ -8,7 +8,7 @@
 > ~3.5 KB total. Runs unmodified in **Node 20+, Bun 1.0+, Deno 1.40+,
 > Cloudflare Workers, Vercel Edge, Netlify Edge** — and in the browser, for
 > client-side throttling — through Web Standards (`Request`, `Response`,
-> `Headers`, `crypto.getRandomValues`).
+> `Headers`, `Date.now`).
 >
 > Five algorithms (sliding-window log, sliding-window counter, token bucket,
 > fixed window, leaky bucket), six storage adapters (memory, Redis,
@@ -172,9 +172,15 @@ devkit-ratelimit/
 │   │       └── index.ts             # rateLimitHandle(limiter) SvelteKit handle
 │   │
 │   ├── compose/
-│   │   ├── index.ts                 # subpath barrel — composeRateLimiters,
-│   │   │                            # tieredRateLimiter, ruledRateLimiter
-│   │   ├── any-of.ts                # composeRateLimiters([a, b]) — first-match-blocks
+│   │   ├── index.ts                 # subpath barrel — composeAll,
+│   │   │                            # composeFirstAllowed, tieredRateLimiter,
+│   │   │                            # ruledRateLimiter
+│   │   ├── all.ts                   # composeAll([a, b]) — logical AND;
+│   │   │                            #   first-to-block wins, prior layers
+│   │   │                            #   have already consumed
+│   │   ├── first-allowed.ts         # composeFirstAllowed([a, b]) — logical
+│   │   │                            #   OR; short-circuits without consuming
+│   │   │                            #   subsequent layers
 │   │   ├── tiered.ts                # tieredRateLimiter({ free, pro, ... })
 │   │   └── ruled.ts                 # ruledRateLimiter({ rules, fallback })
 │   │
@@ -279,13 +285,44 @@ the published `.d.ts` rollup.
  * Node 20+, Bun, Deno, Cloudflare Workers, Vercel Edge and the browser
  * (for client-side throttling).
  *
- * @typeParam K  Optional generic carrying any per-request context the user
- *               attaches via `keyGenerator`. Defaults to `unknown` and is
- *               only meaningful when consumers pass a typed key context to
- *               framework adapters that re-export it.
+ * Two construction forms — both produce an identical `RateLimiter`:
  *
- * @example
- *   import { createRateLimiter, slidingWindow } from '@devkit/ratelimit';
+ *   1. **Spec form** (best tree-shake, recommended for size-sensitive
+ *      builds): import the algorithm factory from its subpath and pass
+ *      its result as `algorithm`. The core engine ships **zero**
+ *      algorithm code in this path; only the imported factory's bytes
+ *      land in the bundle.
+ *
+ *   2. **Flat / sugar form** (fewer imports, ~0.2 KB heavier core):
+ *      pass a string `algorithm` discriminator with the algorithm's
+ *      tuning fields inline. The core inlines a tiny dispatch table
+ *      (~150 B) over the five algorithms' spec normalisers; consumers
+ *      never need to import a subpath. Recommended for getting started,
+ *      docs and screenshot-friendly snippets. The five algorithm
+ *      subpaths remain available for users who want the bundle minimum.
+ *
+ * @typeParam K  Optional context payload threaded through
+ *               `keyGenerator` → `RateLimitResult<K>` → framework
+ *               adapters (so e.g. Hono's `c.var.rateLimit.context` is
+ *               typed end-to-end). Defaults to `undefined`; supply it
+ *               only when your `keyGenerator` returns a structured
+ *               object via `{ key, context }` and you want downstream
+ *               handlers to read `context` typed.
+ *
+ * @example  Sugar form — minimal imports
+ *   import { createRateLimiter } from '@devkit/ratelimit';
+ *   import { createRedisStore } from '@devkit/ratelimit/adapters/redis';
+ *
+ *   const limiter = createRateLimiter({
+ *     algorithm: 'sliding-window',
+ *     limit: 100,
+ *     window: '1 m',
+ *     store: createRedisStore(redis),
+ *   });
+ *
+ * @example  Spec form — minimum bundle
+ *   import { createRateLimiter } from '@devkit/ratelimit';
+ *   import { slidingWindow } from '@devkit/ratelimit/algorithms/sliding-window';
  *   import { createRedisStore } from '@devkit/ratelimit/adapters/redis';
  *
  *   const limiter = createRateLimiter({
@@ -301,15 +338,34 @@ the published `.d.ts` rollup.
  *   }
  *   // ...continue, optionally merging `result.headers` into the response.
  */
-export function createRateLimiter(
-  config: RateLimitConfig,
-): RateLimiter;
+export function createRateLimiter<K = undefined>(
+  config: RateLimitConfig<K>,
+): RateLimiter<K>;
+export function createRateLimiter<K = undefined>(
+  config: RateLimitFlatConfig<K>,
+): RateLimiter<K>;
+
+/**
+ * Flat-form configuration accepted by the sugar overload. The core engine
+ * inlines normalisation + bounds checks for each `algorithm` discriminator
+ * (~150 B total) so consumers do not need to import an algorithm subpath.
+ * The exported union is a discriminated type, so TypeScript narrows the
+ * required tuning fields based on the `algorithm` literal.
+ */
+export type RateLimitFlatConfig<K = undefined> = Omit<RateLimitConfig<K>, 'algorithm'> & (
+  | { algorithm: 'sliding-window';     limit: number;    window: Duration }
+  | { algorithm: 'sliding-window-log'; limit: number;    window: Duration }
+  | { algorithm: 'fixed-window';       limit: number;    window: Duration }
+  | { algorithm: 'token-bucket';       capacity: number; refill: number; interval: Duration }
+  | { algorithm: 'leaky-bucket';       capacity: number; leak: number;   interval: Duration }
+);
 
 export { RateLimitError } from './errors/index.js';
 export { defaultKeyGenerator, composeKey } from './core/key.js';
 export { parseDuration } from './core/duration.js';
 export type {
   RateLimitConfig,
+  RateLimitFlatConfig,
   RateLimiter,
   RateLimiterMiddleware,
   RateLimitResult,
@@ -326,18 +382,20 @@ export type {
 } from './types/index.js';
 ```
 
-The five algorithm factories live behind their own subpaths
-(`@devkit/ratelimit/algorithms/sliding-window` etc.). The core engine has
-zero static knowledge of any algorithm logic — it dispatches on the
-`AlgorithmSpec.kind` discriminator that each factory returns. A build that
-imports only `slidingWindow()` ships **none** of the other four algorithms'
-code paths.
+The five algorithm factories also live behind their own subpaths
+(`@devkit/ratelimit/algorithms/sliding-window` etc.). The core engine
+**dispatches purely on the `AlgorithmSpec.kind` discriminator** — there is
+no per-algorithm logic in `core/*` beyond the unit-normalisation table the
+sugar overload uses. A spec-form build that imports only `slidingWindow()`
+ships **none** of the other four algorithms' code paths; a sugar-form
+build pays ~0.2 KB extra core for the inlined dispatch (over all five
+algorithms' normalisers, which are 30–40 LOC each).
 
 Why subpaths and not a single `algorithms` barrel: every algorithm carries
 its own spec validation (`window` bounds check, `capacity > 0`, etc.) and
-helpers; barrelling them costs ~1.5 KB to a consumer who picked one. The
+helpers. Barrelling them costs ~1.5 KB to a consumer who picked one. The
 subpath split is purely a **bundle-size lever**; the runtime contract is
-identical.
+identical between sugar and spec forms.
 
 ### 2.2 Result + state shape
 
@@ -353,8 +411,14 @@ identical.
  *
  * `state` is the raw, header-style-independent view of the limit; consumers
  * building dashboards or custom transports read from there.
+ *
+ * @typeParam K  Optional context payload threaded from `keyGenerator`. When
+ *               unused (the default), `context` is `undefined` and consumers
+ *               can ignore it; framework adapters that accept a generic
+ *               `RateLimiter<K>` propagate this to handlers (e.g.
+ *               `c.var.rateLimit.context` is typed as `K` in Hono).
  */
-export interface RateLimitResult {
+export interface RateLimitResult<K = undefined> {
   /** `true` when the request is permitted; `false` when over the limit. */
   readonly allowed: boolean;
   /** The opaque key the request was bucketed against. Useful for logs. */
@@ -363,6 +427,20 @@ export interface RateLimitResult {
   readonly state: RateLimitState;
   /** Pre-filled response headers per the configured `headerStyle`. */
   readonly headers: Headers;
+  /**
+   * `true` when the result was produced under fail-open degradation —
+   * either the store was unavailable (`failOpen: true` swallowed the
+   * error) or `peek()` returned a stale last-known state because the
+   * store was unreachable. Consumers building quota-display widgets can
+   * use this to render "approximate" badges.
+   */
+  readonly degraded: boolean;
+  /**
+   * Caller-defined context returned by the `keyGenerator` alongside the
+   * key (when the structured `{ key, context }` form is used). Typed as
+   * `K`; `undefined` when the key generator returned a bare string.
+   */
+  readonly context: K;
 }
 
 export interface RateLimitState {
@@ -390,23 +468,34 @@ export interface RateLimitState {
 ### 2.3 Limiter handle
 
 ```ts
-export interface RateLimiter {
+export interface RateLimiter<K = undefined> {
   /**
    * Atomically consume one (or `cost`) permit(s) for the request's key.
    * Never throws on a missing/invalid key when `keyGenerator` returned a
    * non-empty string. Throws `RateLimitError('STORE_UNAVAILABLE')` when
-   * the underlying store is unreachable, unless `failOpen: true` is set —
-   * in that case the manager logs via `onError`, returns `allowed: true`,
-   * and adds the configured `failOpenHeaderStyle` headers (the policy is
+   * the underlying store is unreachable **and** `failOpen` is `false`
+   * (the default); when `failOpen: true`, the manager emits
+   * `'rate-limit.error'` via the observability hook, returns
+   * `{ allowed: true, degraded: true }`, and stamps the configured
+   * `headerStyle` headers from the **last-known** policy (the policy is
    * still advertised even when we couldn't measure it).
    */
-  check(req: Request, opts?: { cost?: number }): Promise<RateLimitResult>;
+  check(req: Request, opts?: { cost?: number }): Promise<RateLimitResult<K>>;
 
   /**
    * Inspect the current state for a request without consuming a permit.
    * Useful for surfacing live quota in API responses without double-charging.
+   *
+   * Honours `failOpen` exactly the same way `check()` does — when the
+   * store is unreachable and `failOpen: true`, peek resolves with
+   * `{ allowed: true, degraded: true }` carrying the **last-known**
+   * state (zero values when no prior observation exists for the key).
+   * When `failOpen: false` (default), peek throws `STORE_UNAVAILABLE`
+   * just like `check()`. This symmetry matters for quota-display widgets
+   * that consult the limiter on every page render and would otherwise
+   * surface infrastructure flapping as user-facing 5xx.
    */
-  peek(req: Request): Promise<RateLimitResult>;
+  peek(req: Request): Promise<RateLimitResult<K>>;
 
   /**
    * Reset the counter for the request's key. Used by admin tooling
@@ -441,7 +530,7 @@ export interface RateLimiter {
    * exposed for observability and for framework adapters that need to
    * surface `algorithm.kind`, `prefix`, etc. on their context.
    */
-  readonly config: Readonly<NormalisedRateLimitConfig>;
+  readonly config: Readonly<NormalisedRateLimitConfig<K>>;
 }
 
 export type RateLimiterMiddleware = (req: Request) => Promise<Response | undefined>;
@@ -538,11 +627,14 @@ export function leakyBucket(opts: {
 ### 2.5 Configuration
 
 ```ts
-export interface RateLimitConfig {
+export interface RateLimitConfig<K = undefined> {
   /**
-   * The rate-limit policy — produced by one of the algorithm factories.
-   * The core engine **never** inspects fields beyond `kind`; everything
-   * else is passed to the store as opaque parameters of the dispatch.
+   * The rate-limit policy — produced by one of the algorithm factories
+   * (spec form). The sugar overload accepts a `RateLimitFlatConfig`
+   * instead, where `algorithm` is a string discriminator and the tuning
+   * fields are inline. The core engine **never** inspects fields beyond
+   * `kind`; everything else is passed to the store as opaque parameters
+   * of the dispatch.
    */
   algorithm: AlgorithmSpec;
 
@@ -561,9 +653,15 @@ export interface RateLimitConfig {
    * Extract the key the request is bucketed against. Receives the
    * `Request` plus a small context object carrying any framework-supplied
    * fields (Cloudflare `cf.connectingIp`, Vercel `request.geo`, etc.).
-   * Returning `null` / `undefined` / empty string causes the limiter to
-   * **skip** rate limiting for that request and emit `rate-limit.skipped`
-   * via the observability hook.
+   *
+   * May return either:
+   *   - a **bare string** (the key), or `null` / `undefined` / `''` to
+   *     skip rate limiting (the limiter emits `rate-limit.skipped` via
+   *     the observability hook), or
+   *   - a **structured `{ key, context }`** object, where `context` is
+   *     the typed payload that flows through `RateLimitResult<K>` to
+   *     framework adapters and downstream handlers (e.g.
+   *     `c.var.rateLimit.context` in the Hono adapter).
    *
    * Default (when omitted): `defaultKeyGenerator`, which inspects
    * `cf-connecting-ip`, `x-real-ip`, `x-forwarded-for` (first hop),
@@ -575,7 +673,7 @@ export interface RateLimitConfig {
    *
    * @example  (req) => req.headers.get('x-api-key') ?? defaultKeyGenerator(req)
    */
-  keyGenerator?: KeyGenerator;
+  keyGenerator?: KeyGenerator<K>;
 
   /**
    * Prefix prepended to every store key. Defaults to `'rl'`. The prefix
@@ -625,12 +723,19 @@ export interface RateLimitConfig {
   message?: string;
 
   /**
-   * What to do when the underlying store throws. `'closed'` (default)
-   * propagates `STORE_UNAVAILABLE` to the caller — safer when you would
-   * rather take the request path's 5xx than accidentally let a flooded
-   * Redis through. `'open'` swallows the error, allows the request,
-   * and emits `rate-limit.error` via the observability hook so ops can
-   * alert on it without dropping users.
+   * What to do when the underlying store throws. `false` (default) is
+   * **fail-closed** — the manager propagates `STORE_UNAVAILABLE` to the
+   * caller (safer when you would rather take the request path's 5xx
+   * than accidentally let a flooded Redis through). `true` is
+   * **fail-open** — the manager swallows the error, returns
+   * `{ allowed: true, degraded: true }`, stamps `headerStyle` headers
+   * from the last-known policy, and emits `rate-limit.error` via the
+   * observability hook so ops can alert on it without dropping users.
+   *
+   * Applies symmetrically to `check()`, `peek()`, and the
+   * `keyGenerator` throwing path (see §9.2). Throws from
+   * `responseBuilder` and from the observability hook are **always**
+   * swallowed — those code paths are independent of `failOpen`.
    */
   failOpen?: boolean;
 
@@ -649,12 +754,30 @@ export interface RateLimitConfig {
 
   /**
    * Observability hooks. Receives a single discriminated event object so
-   * consumers can wire metrics, logs, and alerts with one switch. The
-   * hook is `await`ed for at most `hookTimeoutMs` (default 50 ms); slow
-   * hooks are dropped with a one-shot dev warning to avoid blocking the
-   * request path.
+   * consumers can wire metrics, logs, and alerts with one switch. See
+   * `hookMode` below for execution semantics.
    */
-  on?: RateLimitHook;
+  on?: RateLimitHook<K>;
+
+  /**
+   * How the observability hook is invoked. Default `'fire-and-forget'`:
+   * the hook is scheduled via `queueMicrotask(() => void hook(event))`
+   * and never awaited, so a slow hook cannot add to the request's
+   * TTFB. This is the right default on Workers / Vercel Edge where
+   * the manager has **no access** to `executionCtx.waitUntil` —
+   * blocking the response on a 50 ms timeout would compound across
+   * every request. `'sync'` awaits the hook (bounded by
+   * `hookTimeoutMs`, default 50 ms) — useful for tests that need
+   * to assert observation order, and acceptable on long-running Node
+   * processes where TTFB cost is amortised. `'wait-until'` is opt-in
+   * for framework adapters that own `executionCtx`; the Hono /
+   * SvelteKit adapters set this automatically when they detect the
+   * binding (see §9.7).
+   */
+  hookMode?: 'fire-and-forget' | 'sync' | 'wait-until';
+
+  /** Bound on `'sync'` hook duration. Ignored in fire-and-forget. */
+  hookTimeoutMs?: number;
 
   /**
    * Override the wall clock. Defaults to `() => Date.now()`. Useful for
@@ -666,10 +789,15 @@ export interface RateLimitConfig {
 
 export type HeaderStyle = 'rfc' | 'legacy' | 'both' | 'none';
 
-export type KeyGenerator = (
+export type KeyGenerator<K = undefined> = (
   req: Request,
   ctx: KeyGeneratorContext,
-) => string | null | undefined | Promise<string | null | undefined>;
+) =>
+  | string
+  | null
+  | undefined
+  | { key: string; context: K }
+  | Promise<string | null | undefined | { key: string; context: K }>;
 
 export interface KeyGeneratorContext {
   /** Cloudflare-supplied client IP if available (`request.cf?.connectingIp`). */
@@ -683,10 +811,10 @@ export interface KeyGeneratorContext {
 
 export type Duration =
   | number
-  | `${number}${' ' | ''}${'ms' | 's' | 'm' | 'h' | 'd'}`
+  | `${bigint}${' ' | ''}${'ms' | 's' | 'm' | 'h' | 'd'}`
   | { milliseconds?: number; seconds?: number; minutes?: number; hours?: number; days?: number };
 
-export interface RateLimitObservation {
+export interface RateLimitObservation<K = undefined> {
   readonly type:
     | 'rate-limit.allowed'
     | 'rate-limit.blocked'
@@ -698,11 +826,23 @@ export interface RateLimitObservation {
   readonly cost: number;
   readonly startedAt: number;
   readonly elapsedMs: number;
+  /** HTTP method extracted from the request — convenient for per-route
+   *  Prometheus labels without re-parsing the key. */
+  readonly method: string;
+  /** Pathname extracted from the request URL (no query string). */
+  readonly path: string;
+  /** The raw `Request`. Provided for advanced consumers; most should read
+   *  the structured `method` / `path` fields above. Kept readonly. */
+  readonly request: Request;
+  /** Caller context returned by the structured key generator. */
+  readonly context: K;
   /** Present iff `type === 'rate-limit.error'`. */
   readonly error?: RateLimitError;
 }
 
-export type RateLimitHook = (event: RateLimitObservation) => void | Promise<void>;
+export type RateLimitHook<K = undefined> = (
+  event: RateLimitObservation<K>,
+) => void | Promise<void>;
 ```
 
 ### 2.6 Store contract (write your own adapter)
@@ -776,6 +916,17 @@ export interface RateLimitStore {
 ```
 
 ### 2.7 Adapter signatures
+
+> **Cloudflare adapters require `@cloudflare/workers-types`** as an
+> optional peer dependency. The published `.d.ts` files for
+> `adapters/cloudflare-kv`, `adapters/cloudflare-d1` and
+> `adapters/durable-object` reference the global `KVNamespace`,
+> `D1Database` and `DurableObjectNamespace` types directly (no internal
+> shim) so consumers see the same types Wrangler generates. Workers
+> users already have `@cloudflare/workers-types` installed; non-Workers
+> consumers can ignore the peer entry — `peerDependenciesMeta` marks it
+> optional, so npm/pnpm/bun installers do not warn. The per-adapter
+> README block calls this out at install time.
 
 ```ts
 // @devkit/ratelimit/adapters/memory
@@ -888,26 +1039,30 @@ export { RateLimitDurableObject } from './ratelimit-do.js';
 // adapter. The adapter exposes the result on `c.var.rateLimit` for
 // downstream handlers that want to surface remaining quota in their JSON
 // response. Zero `declare module` augmentation; the adapter signature
-// flows the limiter's identity through TypeScript inference.
-export function honoRateLimit(
-  limiter: RateLimiter,
+// threads the limiter's `K` generic through Hono's `Variables`, so a
+// `keyGenerator` returning `{ key, context: { tenantId: string } }`
+// surfaces as a fully typed `c.var.rateLimit.context.tenantId`. The
+// adapter also auto-detects `c.executionCtx` and switches the
+// observability hook to `waitUntil` mode (see §2.5 `hookMode`).
+export function honoRateLimit<K = undefined>(
+  limiter: RateLimiter<K>,
   opts?: { onLimit?: (c: import('hono').Context) => Response | Promise<Response> },
 ): import('hono').MiddlewareHandler<{
-  Variables: { rateLimit: RateLimitResult };
+  Variables: { rateLimit: RateLimitResult<K> };
 }>;
 
 // @devkit/ratelimit/frameworks/express
-export function expressRateLimit(
-  limiter: RateLimiter,
+export function expressRateLimit<K = undefined>(
+  limiter: RateLimiter<K>,
 ): (req: ExpressReq, res: ExpressRes, next: () => void) => Promise<void>;
 
 // @devkit/ratelimit/frameworks/next
-export function withRateLimit<H extends RouteHandler>(
-  limiter: RateLimiter,
+export function withRateLimit<H extends RouteHandler, K = undefined>(
+  limiter: RateLimiter<K>,
   handler: H,
 ): H;
-export function rateLimitMiddleware(
-  limiter: RateLimiter,
+export function rateLimitMiddleware<K = undefined>(
+  limiter: RateLimiter<K>,
   matcher?: (req: import('next/server').NextRequest) => boolean,
 ): (req: import('next/server').NextRequest) => Promise<import('next/server').NextResponse>;
 ```
@@ -916,21 +1071,52 @@ export function rateLimitMiddleware(
 
 ```ts
 /**
- * Run multiple limiters; the first one to **block** wins. The returned
- * limiter's `check()` calls each child in declaration order and returns
- * the first `allowed: false` result. Headers from a successful pass are
- * **merged** so clients see the binding policy alongside any others.
+ * **Logical AND.** Run every limiter in declaration order; the first one
+ * to **block** wins. Layers that allow have already **consumed** their
+ * permit by the time a later layer blocks — this is the correct semantics
+ * for layered quotas (per-IP + per-key + per-tenant where any one
+ * exhausting blocks the request) but it is a foot-gun if you're hoping
+ * for short-circuit-on-allow. Read the type:
  *
- * Use this to layer per-IP + per-key + per-tenant quotas where any one
- * exhausting blocks the request.
+ *   `composeAll([ipLimit, keyLimit, tenantLimit])`
+ *
+ * The name reads as "all must allow"; the docblock and the README block
+ * spell out the consume-on-allow side-effect prominently. Each layer
+ * emits its own `rate-limit.allowed | rate-limit.blocked` observation,
+ * so dashboards can attribute consumption to the layer that drove it.
+ *
+ * Headers from intermediate "allowed" layers are **merged** alongside
+ * the binding (blocking) layer's headers so clients see all active
+ * policies in the response.
  */
-export function composeRateLimiters(limiters: readonly RateLimiter[]): RateLimiter;
+export function composeAll(limiters: readonly RateLimiter[]): RateLimiter;
+
+/**
+ * **Logical OR with short-circuit on the first allow.** Tries each
+ * limiter in declaration order and returns the first `allowed: true`
+ * result **without consuming permits in subsequent layers**. Use this
+ * for "any one of these grants permission" — e.g. a paid-tier API key
+ * bypasses the per-IP quota. If every layer blocks, returns the result
+ * from the layer with the **soonest `retryAfter`** (so the client gets
+ * the most actionable wait time). Per-layer observations are emitted
+ * for every layer that was consulted (not just the winning one), so
+ * dashboards can see which tiers were attempted.
+ */
+export function composeFirstAllowed(limiters: readonly RateLimiter[]): RateLimiter;
 
 /**
  * Tier-resolved limiter — the resolver picks one limiter per request
- * (e.g. by API plan) and the chosen limiter handles the check. Unknown
- * tiers fall through to `fallback` if supplied, else throw
- * `INVALID_TIER`.
+ * (e.g. by API plan) and the chosen limiter handles the check.
+ *
+ * **Unknown-tier policy:** when the resolver returns a tier that is not
+ * in `tiers` and no `fallback` is supplied, the limiter **skips** the
+ * request (returns `{ allowed: true }`) and emits a
+ * `rate-limit.skipped` observation tagged with the unknown tier name.
+ * This avoids turning a resolver/config drift into a production 5xx;
+ * ops teams alert on a non-zero `skipped` rate instead. Pass
+ * `fallback: someLimiter` to apply a catch-all policy instead of
+ * skipping. (The previous draft of this plan threw `INVALID_TIER` —
+ * production safety wins over fail-loud here.)
  */
 export function tieredRateLimiter<Tier extends string>(opts: {
   resolve: (req: Request) => Tier | Promise<Tier>;
@@ -951,14 +1137,17 @@ export function ruledRateLimiter(opts: {
 
 ### 2.10 Ideal DX — Hono + Cloudflare Durable Objects
 
+The minimum useful limiter is **two imports** in sugar form, three in
+spec form. We show both — sugar first because that's what most users
+should write, then spec form for size-sensitive deployments.
+
 ```ts
+// Sugar form — minimal imports, recommended for getting started.
 import { Hono } from 'hono';
 import { createRateLimiter } from '@devkit/ratelimit';
-import { tokenBucket } from '@devkit/ratelimit/algorithms/token-bucket';
-import { slidingWindow } from '@devkit/ratelimit/algorithms/sliding-window';
 import { createDurableObjectStore, RateLimitDurableObject } from '@devkit/ratelimit/adapters/durable-object';
 import { honoRateLimit } from '@devkit/ratelimit/frameworks/hono';
-import { composeRateLimiters } from '@devkit/ratelimit/compose';
+import { composeAll } from '@devkit/ratelimit/compose';
 
 interface Env {
   RATELIMIT_DO: DurableObjectNamespace;
@@ -974,24 +1163,57 @@ app.use('*', async (c, next) => {
 
   // Layered: 1000/min per IP, plus burst-friendly 50-token bucket per API key.
   const ipLimit = createRateLimiter({
-    algorithm: slidingWindow({ limit: 1000, window: '1 m' }),
+    algorithm: 'sliding-window',
+    limit: 1000,
+    window: '1 m',
     store,
     prefix: 'rl:ip',
   });
-  const keyLimit = createRateLimiter({
-    algorithm: tokenBucket({ capacity: 50, refill: 5, interval: '1 s' }),
+  const keyLimit = createRateLimiter<{ tenantId: string }>({
+    algorithm: 'token-bucket',
+    capacity: 50,
+    refill: 5,
+    interval: '1 s',
     store,
     prefix: 'rl:key',
-    keyGenerator: (req) => req.headers.get('x-api-key') ?? null,
+    keyGenerator: (req) => {
+      const apiKey = req.headers.get('x-api-key');
+      if (!apiKey) return null;
+      return { key: apiKey, context: { tenantId: tenantOf(apiKey) } };
+    },
   });
 
-  const limiter = composeRateLimiters([ipLimit, keyLimit]);
+  // composeAll = "every layer must allow"; intermediate layers consume
+  // their permit on the way through. See §2.9 for composeFirstAllowed.
+  const limiter = composeAll([ipLimit, keyLimit]);
   return honoRateLimit(limiter)(c, next);
 });
 
 app.post('/v1/complete', (c) => {
-  const { remaining } = c.var.rateLimit.state;     // typed via the manager generic
-  return c.json({ ok: true, remaining });
+  // Both .state.remaining and .context.tenantId are typed end-to-end
+  // because honoRateLimit threaded the limiter's K generic through.
+  const { remaining } = c.var.rateLimit.state;
+  const { tenantId } = c.var.rateLimit.context;
+  return c.json({ ok: true, remaining, tenantId });
+});
+```
+
+The same setup in spec form drops ~200 B from the core (the algorithm
+factories tree-shake the inline normalisers) at the cost of two
+additional imports per algorithm:
+
+```ts
+// Spec form — minimum bundle size; recommended for size-budgeted edge deploys.
+import { slidingWindow } from '@devkit/ratelimit/algorithms/sliding-window';
+import { tokenBucket } from '@devkit/ratelimit/algorithms/token-bucket';
+
+const ipLimit = createRateLimiter({
+  algorithm: slidingWindow({ limit: 1000, window: '1 m' }),
+  store, prefix: 'rl:ip',
+});
+const keyLimit = createRateLimiter({
+  algorithm: tokenBucket({ capacity: 50, refill: 5, interval: '1 s' }),
+  store, prefix: 'rl:key',
 });
 ```
 
@@ -1122,16 +1344,35 @@ state.
 
 `AlgorithmSpec` is the central type that flows from algorithm factories
 into the store. The discriminator is `kind`, a string literal type the
-store narrows on:
+store narrows on. Every variant carries a **brand** so the only way to
+construct one is through the corresponding factory (or the sugar
+overload's inlined normaliser, which goes through the same internal
+mint helper). A consumer who tries to write
+`{ kind: 'token-bucket', capacity: -1, refill: 0, intervalMs: 0 } as AlgorithmSpec`
+gets a compile-time error on the `as` cast because the brand symbol is
+not assignable from outside the package; the value is **read-assignable**
+to `AlgorithmSpec` (so storage adapter authors can still type their
+parameters as `AlgorithmSpec` and pattern-match the union) but not
+**write-constructible** by hand.
 
 ```ts
+declare const AlgorithmBrand: unique symbol;
+type Branded<K extends string> = { readonly [AlgorithmBrand]: K };
+
 export type AlgorithmSpec =
-  | { kind: 'sliding-window-counter'; limit: number; windowMs: number }
-  | { kind: 'sliding-window-log'; limit: number; windowMs: number }
-  | { kind: 'token-bucket'; capacity: number; refill: number; intervalMs: number }
-  | { kind: 'fixed-window'; limit: number; windowMs: number }
-  | { kind: 'leaky-bucket'; capacity: number; leak: number; intervalMs: number };
+  | (Branded<'sliding-window-counter'> & { kind: 'sliding-window-counter'; limit: number; windowMs: number })
+  | (Branded<'sliding-window-log'>      & { kind: 'sliding-window-log';      limit: number; windowMs: number })
+  | (Branded<'token-bucket'>            & { kind: 'token-bucket';            capacity: number; refill: number; intervalMs: number })
+  | (Branded<'fixed-window'>            & { kind: 'fixed-window';            limit: number; windowMs: number })
+  | (Branded<'leaky-bucket'>            & { kind: 'leaky-bucket';            capacity: number; leak: number; intervalMs: number });
 ```
+
+The brand symbol is **not exported** — the only way to obtain a value of
+this shape is through `slidingWindow()`, `tokenBucket()`, etc. (or the
+sugar overload's internal normaliser). Adapter authors who need to
+construct test fixtures import a `@internal` helper from
+`@devkit/ratelimit/testing` (separate subpath, not in the published
+surface; usable only via patched `exports`).
 
 Every algorithm factory **normalises units at construction time** —
 `Duration` → `windowMs` / `intervalMs` integers. The store never sees a
@@ -1191,16 +1432,22 @@ adopt a `StoreKey` type they cannot construct.
 ```ts
 export type Duration =
   | number
-  | `${number}${' ' | ''}${'ms' | 's' | 'm' | 'h' | 'd'}`
+  | `${bigint}${' ' | ''}${'ms' | 's' | 'm' | 'h' | 'd'}`
   | { milliseconds?: number; seconds?: number; minutes?: number; hours?: number; days?: number };
 ```
 
-The template-literal form (`'1 m'`, `'500ms'`, `'1h'`) is
-constructor-time-validated; bad strings (`'1 minute'`, `'1.5h'`) become
-TypeScript errors at the call site rather than runtime errors at the
-bucket boundary. The parser in `core/duration.ts` accepts integer +
-unit; fractional values must use the object form (`{ minutes: 1.5 }`)
-so the truncation is explicit.
+The template-literal form uses TypeScript's `${bigint}` placeholder
+(not `${number}`) so the type **rejects decimals and signs at compile
+time**: `'1m'`, `'500ms'`, `'1 h'`, `'60 s'` all type-check;
+`'1.5h'`, `'-1m'`, `'NaN s'`, `'1 minute'` are TS errors at the
+call site. (`${number}` would have accepted decimals, signs, exponents
+and `NaN` — the previous draft of this plan claimed compile-time
+rejection without delivering it.) Fractional values must use the
+object form (`{ minutes: 1.5 }`) so the truncation is explicit, and
+the runtime parser in `core/duration.ts` re-validates the string with
+a regex as a defence-in-depth check (`/^[0-9]+\s?(ms|s|m|h|d)$/`) for
+consumers who pass a non-literal `string` widened away from the
+template type.
 
 ### 4.5 Compile-time guarantees enforced
 
@@ -1228,15 +1475,19 @@ so the truncation is explicit.
 |--------------------------------------|-------------------------------|--------------------------------------------------------|
 | `limiter.check(req)`                 | over the limit                | **return `{ allowed: false, ... }`** — never throws    |
 | `limiter.check(req)`                 | `keyGenerator` returns `null` | **return `{ allowed: true, ... }`** + `'rate-limit.skipped'` event |
+| `limiter.check(req)`                 | `keyGenerator` throws (`failOpen: false`) | **throw `INVALID_KEY`** — wraps the original cause     |
+| `limiter.check(req)`                 | `keyGenerator` throws (`failOpen: true`)  | return `{ allowed: true, degraded: true }` + `'rate-limit.error'` event — a buggy extractor cannot DoS the API |
 | `limiter.check(req)`                 | store unreachable (`failOpen: false` — default) | **throw `STORE_UNAVAILABLE`**                          |
-| `limiter.check(req)`                 | store unreachable (`failOpen: true`)            | return `{ allowed: true }` + `'rate-limit.error'` event |
+| `limiter.check(req)`                 | store unreachable (`failOpen: true`)            | return `{ allowed: true, degraded: true }` + `'rate-limit.error'` event |
 | `limiter.check(req)`                 | `cost > capacity`             | return `{ allowed: false, retryAfter: window }`        |
 | `limiter.check(req, { cost: -1 })`   | invalid cost                  | **throw `INVALID_COST`** — programmer error            |
-| `limiter.peek(req)`                  | store unreachable             | always throws (peek has no fail-open option)           |
+| `limiter.peek(req)`                  | store unreachable (`failOpen: false`) | **throw `STORE_UNAVAILABLE`**                          |
+| `limiter.peek(req)`                  | store unreachable (`failOpen: true`)  | return `{ allowed: true, degraded: true }` carrying the last-known state (zero values when no prior observation exists) |
 | `limiter.reset(req)`                 | nothing to reset              | resolve `false` — idempotent                           |
 | `limiter.middleware()(req)`          | over the limit                | resolve `Response` (429) — never throws                |
 | `createRateLimiter(config)`          | invalid algorithm spec        | **throw at construction `INVALID_CONFIG`**             |
 | `slidingWindow({ limit: 0 })`        | impossible bound              | **throw at construction `INVALID_CONFIG`**             |
+| `tieredRateLimiter` — unknown tier, no fallback | resolver drift     | return `{ allowed: true }` + `'rate-limit.skipped'` event tagged with the unknown tier name (was `INVALID_TIER` throw — production safety) |
 
 The rule of thumb: **the request hot path never throws on user-controlled
 inputs** (over-the-limit, missing IP, bad client headers — all
@@ -1286,12 +1537,31 @@ keys.
 
 For every "expected" event (`allowed`, `blocked`, `skipped`, `error`)
 the manager emits a structured `RateLimitObservation` to the configured
-`on` hook **before** returning. This lets ops teams build dashboards on
-rate-limit anomalies (spike of `blocked` from one CIDR, sudden
-`error` rate from a store) without instrumenting the library
-themselves. The hook is `await`ed for at most `hookTimeoutMs`
-(default 50 ms); slower hooks are dropped with a one-shot dev warning
-to avoid blocking the request path.
+`on` hook. This lets ops teams build dashboards on rate-limit anomalies
+(spike of `blocked` from one CIDR, sudden `error` rate from a store)
+without instrumenting the library themselves.
+
+**The hook never blocks the request path by default.** The default
+`hookMode` is `'fire-and-forget'`: the manager schedules the hook via
+`queueMicrotask(() => void hook(event).catch(noop))` and returns the
+result immediately. This matters most on Cloudflare Workers and Vercel
+Edge — runtimes where the bare middleware path has **no access** to
+`executionCtx.waitUntil`, so any `await`ed hook would directly add to
+TTFB on every request. The fire-and-forget tradeoff is that on
+short-lived edge isolates a hook call may be cancelled mid-flight
+when the response settles; for guaranteed delivery, either:
+
+  1. Set `hookMode: 'wait-until'` and use a framework adapter that
+     wires `executionCtx.waitUntil` (Hono, SvelteKit auto-detect; bare
+     Workers users pass `executionCtx` to the limiter explicitly), or
+  2. Set `hookMode: 'sync'` on long-lived Node processes where the
+     extra `await` is amortised and observation order matters (tests
+     are the canonical case — set `'sync'` in the test setup).
+
+The `'sync'` mode bounds the hook at `hookTimeoutMs` (default 50 ms);
+slower hooks are dropped with a one-shot dev warning. The
+`'fire-and-forget'` mode applies no timeout — the runtime takes the
+hook with whatever scheduling guarantees it provides.
 
 ---
 
@@ -1310,7 +1580,7 @@ core ships nothing but its own code, so the headline number is honest:
 
 | Subpath                                       | Library budget | Notes                                          |
 |-----------------------------------------------|---------------|-------------------------------------------------|
-| `@devkit/ratelimit`                           | **3.0 KB**    | core engine — limiter + consume + headers + response + duration + key + time + invariant. Zero algorithm or adapter code. |
+| `@devkit/ratelimit`                           | **3.2 KB**    | core engine — limiter + consume + headers + response + duration + key + time + invariant + the sugar-overload's inlined algorithm-spec normalisers (~0.2 KB across all five). Zero adapter code. Spec-form-only consumers can ignore the normalisers; they tree-shake when nothing imports the sugar overload signature. |
 | `@devkit/ratelimit/errors`                    | **0.4 KB**    | `RateLimitError` + codes                         |
 | `@devkit/ratelimit/algorithms/sliding-window` | **0.5 KB**    | counter approximation factory                    |
 | `@devkit/ratelimit/algorithms/sliding-window-log` | **0.5 KB** | exact-bound factory                              |
@@ -1329,18 +1599,27 @@ core ships nothing but its own code, so the headline number is honest:
 | `@devkit/ratelimit/frameworks/fastify`        | **0.5 KB**    | fastify-plugin wrapper                           |
 | `@devkit/ratelimit/frameworks/next`           | **0.7 KB**    | Route Handler wrapper + middleware split         |
 | `@devkit/ratelimit/frameworks/sveltekit`      | **0.5 KB**    | handle wrapper                                   |
-| `@devkit/ratelimit/compose`                   | **0.6 KB**    | composeRateLimiters + tiered + ruled             |
+| `@devkit/ratelimit/compose`                   | **0.7 KB**    | composeAll + composeFirstAllowed + tiered + ruled |
 
 Budgets are enforced in CI via `size-limit` (see `.size-limit.json`). A
-PR that breaks the budget fails the check. The 3 KB core is achievable
-because no algorithm, adapter, or framework code is reachable from
-`src/index.ts` — every module is its own subpath and is only pulled in
-when the user explicitly imports it.
+PR that breaks the budget fails the check. The 3.2 KB core is achievable
+because no adapter or framework code is reachable from `src/index.ts` —
+every adapter/framework module is its own subpath and is only pulled in
+when the user explicitly imports it. Algorithms straddle: their data
+factories live behind subpaths (`slidingWindow()` etc.), but a tiny
+inlined normaliser table for each `kind` ships in the core to power the
+sugar-form `createRateLimiter({ algorithm: 'sliding-window', ... })`
+overload. The `~0.2 KB` cost of those inline normalisers is the
+deliberate price for the headline DX win — most users avoid two
+imports per algorithm.
 
-A typical Cloudflare Workers deployment using `slidingWindow` + `KV`
-ships **3.0 + 0.5 + 1.2 = ~4.7 KB** total. The same code on Bun + Redis
-ships **3.0 + 0.5 + 2.0 = ~5.5 KB**. We headline `≤6 KB` honestly: even
-the heaviest cut (core + sliding-window-log + Redis + Hono) lands at
+A typical Cloudflare Workers deployment using sugar form + `KV`
+ships **3.2 + 1.2 = ~4.4 KB** (no algorithm subpath needed). The same
+code in spec form ships **3.0 + 0.5 + 1.2 = ~4.7 KB** (the spec form
+trims the unused inline normalisers down to ~3.0 KB core because
+nothing references them). On Bun + Redis it lands at **~5.3 KB**
+sugar / **~5.5 KB** spec. We headline `≤6 KB` honestly: even the
+heaviest cut (core + sliding-window-log + Redis + Hono) lands at
 **~6 KB**.
 
 ### 6.2 Tree-shaking enablers
@@ -1432,7 +1711,7 @@ The **strategic value** of zero deps for a rate limiter:
 | `next`                         | `frameworks/next`                       |
 | `@sveltejs/kit`                | `frameworks/sveltekit`                  |
 | `@upstash/redis`               | `adapters/upstash` (types + Redis class) |
-| `@cloudflare/workers-types`    | `adapters/cloudflare-kv`, `cloudflare-d1`, `durable-object` (devDep — types only) |
+| `@cloudflare/workers-types`    | `adapters/cloudflare-kv`, `cloudflare-d1`, `durable-object` — types-only, **optional peer dep** so consumers who install one of those adapter subpaths get `KVNamespace` / `D1Database` / `DurableObjectNamespace` from the same versioned source Wrangler does. Without it the published `.d.ts` rollup raises TS2304. Workers users always have it installed; non-Workers consumers get no warning because of `peerDependenciesMeta` (see below). |
 
 All peer deps are listed in `peerDependenciesMeta` with `"optional":
 true`, so npm/pnpm/bun installers don't warn when a consumer skips an
@@ -1589,7 +1868,7 @@ file.
    condition.
 4. **`limit === 0` at construction** — throws `INVALID_CONFIG` from
    the algorithm factory ("a zero limit blocks every request — use
-   `composeRateLimiters` with a permissive layer instead").
+   `composeAll` with a permissive layer instead").
 5. **Sliding-window-counter at the window boundary** — the
    approximation interpolates between the previous and current
    window's counters by the fraction of time elapsed. Worst-case
@@ -1637,11 +1916,19 @@ file.
    default-on because legitimate large IPv6 networks (mobile
    carriers) would all collapse to one bucket and trip the limit
    for unrelated users.
-5. **`keyGenerator` throws** — wrapped in
-   `RateLimitError('INVALID_KEY')`; the request is **rejected**
-   (treated as `allowed: false` with a built 429), not skipped.
-   A throwing key generator is a programmer bug, not a runtime
-   condition.
+5. **`keyGenerator` throws** — honours `failOpen` (the same setting
+   the store-error path consults, so consumers reason about a single
+   degradation switch). With `failOpen: false` (default) the manager
+   wraps the cause in `RateLimitError('INVALID_KEY')` and rejects
+   the request as `allowed: false` + 429 — failing closed, the
+   safe behaviour for fresh deployments. With `failOpen: true` the
+   manager swallows the throw, emits `'rate-limit.error'` with the
+   wrapped cause, and returns `{ allowed: true, degraded: true }` —
+   so a regex bug in a custom extractor cannot DoS 100% of traffic
+   the moment it ships. The reviewer's concrete scenario was: a
+   late-night deploy regresses the API-key extractor, every
+   request throws, and the limiter takes the API down. Honouring
+   `failOpen` here turns that outage into an alert.
 6. **`keyGenerator` returns a 1 MB string** — checked against
    the configured `maxKeyLength` (default 1024 chars). Over the
    limit: `KEY_TOO_LONG`. Most stores have hard limits (KV
@@ -1751,32 +2038,58 @@ file.
 
 ### 9.6 Composition edge cases
 
-1. **`composeRateLimiters([])`** — throws `INVALID_CONFIG` at
-   construction (an empty composition has no defined behaviour).
-2. **`composeRateLimiters([a])`** — equivalent to `a` directly,
-   no overhead. Tests assert byte parity for the headers.
-3. **One layer skips, another blocks** — the skip is recorded in
+1. **`composeAll([])` / `composeFirstAllowed([])`** — both throw
+   `INVALID_CONFIG` at construction (an empty composition has no
+   defined behaviour).
+2. **`composeAll([a])` / `composeFirstAllowed([a])`** — equivalent
+   to `a` directly, no overhead. Tests assert byte parity for the
+   headers.
+3. **`composeAll`: layers a, b allow then c blocks** — a and b
+   have already **consumed** their permits before c rejects. This
+   is the documented logical-AND semantics — for layered quotas
+   (per-IP + per-key + per-tenant) it's exactly what consumers
+   want. For "any one allow short-circuits" semantics use
+   `composeFirstAllowed` instead. Each layer emits its own
+   `'rate-limit.allowed'` / `'rate-limit.blocked'` observation,
+   so dashboards can attribute consumption to the layer that
+   drove it (the README has a recipe for "which layer is hot").
+4. **`composeFirstAllowed`: every layer blocks** — return value's
+   `state.retryAfter` is the **minimum** across all rejecting
+   layers (the most actionable wait for the client). The
+   `headers` reflect the layer with that minimum `retryAfter`.
+5. **One layer skips, another blocks** — the skip is recorded in
    the observation hook (`type: 'rate-limit.skipped'` for the
    first, then `type: 'rate-limit.blocked'` for the blocking
    layer). The result's `headers` reflect the **blocking** layer
    (so clients see the binding policy in 429), with the skipped
    layer's policy header included alongside if the blocking
    layer used `headerStyle: 'rfc'` or `'both'`.
-4. **`tieredRateLimiter` resolver returns an unknown tier with no
-   fallback** — throws `INVALID_TIER`. Test harness asserts the
-   error code so consumers can wire `try/catch` around the
-   middleware.
-5. **`ruledRateLimiter` rule predicates throw** — bubbled as
+6. **`tieredRateLimiter` resolver returns an unknown tier with no
+   fallback** — the request is **skipped** (returns
+   `{ allowed: true }`) and the manager emits a
+   `'rate-limit.skipped'` observation tagged with the unknown
+   tier name. Ops alert on a non-zero `skipped` rate; this avoids
+   turning a resolver/config drift into a production 5xx (the
+   prior draft of this plan threw `INVALID_TIER`, which the
+   reviewer correctly flagged as a foot-gun). Consumers who
+   prefer fail-loud semantics still get them by passing an
+   explicit `fallback: throwingLimiter`.
+7. **`ruledRateLimiter` rule predicates throw** — bubbled as
    `RateLimitError('INVALID_CONFIG', 'rule predicate threw', { cause })`;
    the request is rejected (treated as 429), not allowed
    through. Predicates are not user-input territory.
 
 ### 9.7 Framework adapter edge cases
 
-1. **Hono + Workers + KV** — the adapter wires
-   `c.executionCtx.waitUntil(observe(event))` so the
-   observability hook does not delay the response. Documented in
-   the Hono adapter's README.
+1. **Hono + Workers + KV** — the adapter detects `c.executionCtx`
+   and switches the limiter's `hookMode` to `'wait-until'`,
+   wrapping the observability hook in
+   `c.executionCtx.waitUntil(hook(event))`. The bare middleware
+   path on Workers/Vercel Edge has no access to `executionCtx`,
+   so it stays on the default `'fire-and-forget'` mode (see §5.4)
+   — adding the hook's latency to TTFB on every request would
+   defeat the point of edge deployment. Documented in the Hono
+   adapter's README.
 2. **Express request without `req.headers`** — extremely old
    Express forks (≤3.x) may not populate; the adapter falls
    back to `IncomingMessage.rawHeaders`. Documented as best-effort
@@ -1869,3 +2182,171 @@ the same namespace or a problem we deliberately don't take on.
 - **Built-in metrics exporter (Prometheus / OpenTelemetry).** The
   observability hook is the integration point; we don't take a
   dependency on either ecosystem.
+
+---
+
+## Review Changes
+
+This section records every point Vasyl Bruhanda raised in the PR #1
+architecture review and what was changed (or, for the one item I
+disagreed with, why I held the line). Sections of the plan that moved
+are noted in parentheses.
+
+### MAJOR
+
+- **DX gap vs `@upstash/ratelimit` — three imports for the minimum
+  useful limiter.** **Agreed.** Added a sugar overload of
+  `createRateLimiter` that accepts a flat `RateLimitFlatConfig` with
+  `algorithm` as a string discriminator (`'sliding-window'`,
+  `'token-bucket'`, etc.) and the algorithm's tuning fields inline,
+  so the minimum useful limiter is now two imports
+  (`createRateLimiter` + the chosen store). The core engine inlines a
+  ~150 B normaliser table over the five algorithms; spec form (with
+  algorithm subpath import) remains available and trims those
+  normalisers out for size-sensitive builds. Documented in the §2.1
+  docblock + a "two forms" callout, and demonstrated in the §2.10
+  example. Bumped core size budget from 3.0 KB → 3.2 KB (PLAN.md
+  §2.1, §2.10, §6.1; package.json `size-limit.core`).
+
+- **`failOpen` typing inconsistent across the doc — declared as
+  `boolean` but described as `'closed'` / `'open'`; peek "always
+  throws" contradicted the spirit of `failOpen`.** **Agreed.**
+  Rewrote the `failOpen` docblock to use boolean-only language
+  (false = fail-closed, true = fail-open with `degraded: true` on
+  the result). Made `peek()` honour `failOpen` symmetrically with
+  `check()` — when fail-open and the store is unreachable, peek
+  returns `{ allowed: true, degraded: true }` carrying the
+  last-known state (zero values when no prior observation exists).
+  Quota-display widgets that consult the limiter on every page
+  render no longer surface infrastructure flapping as 5xx. Added
+  a `degraded: boolean` field to `RateLimitResult` for both
+  fail-open paths. Updated §5.1 error-table rows to reflect the
+  new behaviour. (PLAN.md §2.2, §2.3, §2.5, §5.1.)
+
+- **`RateLimiter` is not generic but docs claim it is via
+  `@typeParam K`.** **Agreed.** Threaded `K` through
+  `RateLimiter<K>`, `RateLimitConfig<K>`, `RateLimitResult<K>`,
+  `KeyGenerator<K>`, `RateLimitObservation<K>`, and
+  `RateLimitHook<K>`. Updated `KeyGenerator` to accept either a
+  bare string or a structured `{ key, context: K }` payload — the
+  latter flows through to `result.context` typed as `K`. Made the
+  framework adapter signatures (Hono, Express, Next) explicitly
+  generic so `c.var.rateLimit.context.tenantId` is typed end-to-end
+  in the §2.10 Hono example. (PLAN.md §2.1, §2.2, §2.3, §2.5,
+  §2.8, §2.10.)
+
+- **`@cloudflare/workers-types` leaks via published `.d.ts` but
+  isn't a peer dep.** **Agreed.** Moved
+  `@cloudflare/workers-types` from devDep-only to an optional peer
+  dep (`>=4.20240925 <5`) so consumers installing
+  `adapters/cloudflare-kv` / `cloudflare-d1` / `durable-object`
+  get `KVNamespace`, `D1Database`, `DurableObjectNamespace` from
+  the same source Wrangler does. `peerDependenciesMeta` keeps it
+  silent for non-Workers installs. Added a top-of-§2.7 callout
+  block and updated the §7.2 peer-dep table. (PLAN.md §2.7, §7.2;
+  package.json `peerDependencies`, `peerDependenciesMeta`.)
+
+### MEDIUM
+
+- **`Duration` template type does not reject `'1.5h'` at compile
+  time — `${number}` accepts decimals, signs, NaN.** **Agreed.**
+  Switched the template literal from `${number}` to `${bigint}`,
+  which TS uses to enforce non-negative integer literals. `'1.5h'`,
+  `'-1m'`, `'NaN s'`, `'1 minute'` are now genuine compile-time
+  errors at the call site. Rewrote §4.4 to describe what `${bigint}`
+  delivers (no decimals/signs) and noted that the runtime parser in
+  `core/duration.ts` re-validates with a regex as a defence-in-depth
+  check for non-literal strings. (PLAN.md §2.5 `Duration` export,
+  §4.4.)
+
+- **`composeRateLimiters` consumes preceding layers' quota silently
+  — needs to be loud in the doc and in the type.** **Agreed.**
+  Renamed to `composeAll` (mirrors logical AND) and added a peer
+  `composeFirstAllowed` that short-circuits on the first allow
+  without consuming the rest (logical OR). The `composeAll` docblock
+  spells out the consume-on-allow side-effect prominently and notes
+  that each layer emits its own observation. `composeFirstAllowed`'s
+  all-blocked branch returns the layer with the soonest `retryAfter`
+  so clients get the most actionable wait. Updated §2.10 example
+  and §9.6 edge-case rules. (PLAN.md §2.9, §2.10, §9.6.)
+
+- **Observability hook awaits block the response on non-Hono
+  runtimes.** **Agreed.** Changed the default `hookMode` to
+  `'fire-and-forget'` (the manager schedules the hook via
+  `queueMicrotask` and never awaits). Added a `hookMode` config
+  option with three values: `'fire-and-forget'` (default),
+  `'sync'` (bounded by `hookTimeoutMs` — for tests + long-lived
+  Node), and `'wait-until'` (opt-in for framework adapters that
+  own `executionCtx`). The Hono / SvelteKit adapters auto-detect
+  `executionCtx` and switch to `'wait-until'`; the bare
+  Workers/Vercel Edge middleware path stays on fire-and-forget so
+  it never adds the hook's latency to TTFB. (PLAN.md §2.5 `hookMode`
+  + `hookTimeoutMs`, §5.4, §9.7 item 1.)
+
+- **`keyGenerator` throwing → reject means a buggy extractor DoS's
+  the API.** **Agreed.** Made the keyGenerator-throws path honour
+  `failOpen` symmetrically with the store-error path, so a regex
+  bug in a custom extractor cannot DoS 100% of traffic. With
+  `failOpen: true` the manager swallows the throw, emits
+  `'rate-limit.error'` with the cause, and returns
+  `{ allowed: true, degraded: true }`. With `failOpen: false`
+  (default) the previous reject behaviour stands. Updated §5.1
+  table and rewrote §9.2 item 5. (PLAN.md §2.5 `failOpen` doc,
+  §5.1, §9.2 item 5.)
+
+- **`AlgorithmSpec` is exported with raw fields, bypassing factory
+  validation.** **Agreed.** Branded each variant of `AlgorithmSpec`
+  via a non-exported `AlgorithmBrand` symbol so only the algorithm
+  factories (and the sugar overload's internal mint helper) can
+  construct values. Adapter authors who type their parameters as
+  `AlgorithmSpec` keep working (the type is read-assignable for
+  pattern-matching), but a consumer can no longer write
+  `{ kind: 'token-bucket', capacity: -1, ... } as AlgorithmSpec`
+  to bypass bounds checks. Test fixtures get an `@internal`
+  helper from `@devkit/ratelimit/testing` (separate subpath, not
+  in the published surface). (PLAN.md §4.1.)
+
+### LOW
+
+- **Inconsistent factory naming (`createRateLimiter` vs
+  `slidingWindow` vs `honoRateLimit`).** **Disagreed; held the
+  line.** The reviewer's suggestion (bare nouns everywhere:
+  `rateLimiter()`, `memoryStore()`, `honoRateLimit()`) saves ~5
+  chars per call site, but the current convention encodes useful
+  semantics: `createX` for runtime handles (limiters and stores
+  — the JS standard-library convention from `createServer`,
+  `createElement`, `createConnection`); bare nouns for **data
+  factories** (algorithm specs, which return frozen plain
+  objects, not handles); verb-noun for framework adapters
+  (`honoRateLimit`, `expressRateLimit` — these *do* an action,
+  applying rate limiting to a framework's request lifecycle).
+  Bare-noun `rateLimiter()` would also collide ergonomically with
+  the imported `RateLimiter` type for users who like to alias.
+  I'll add the rationale to the README's "API conventions"
+  section so contributors know which bucket a new factory
+  belongs to, but I'd rather keep the three-bucket convention
+  intentional than chase line-length parity.
+
+- **`RateLimitObservation` is missing request context (`path`,
+  `method`).** **Agreed.** Added `path: string`, `method: string`,
+  `request: Request`, and `context: K` (when the structured key
+  generator was used) to `RateLimitObservation`. Per-route
+  Prometheus labels are now possible without consumers re-deriving
+  from the key. (PLAN.md §2.5 `RateLimitObservation` interface.)
+
+- **`crypto.getRandomValues` is listed in the intro but never
+  referenced.** **Agreed.** Removed it from the intro and replaced
+  the slot with `Date.now`, which is genuinely used by every
+  algorithm via the `core/time.ts` indirection. (PLAN.md intro
+  paragraph.)
+
+- **`tieredRateLimiter` throws `INVALID_TIER` on unknown tier — a
+  drift between resolver and tier table becomes a 5xx in
+  production.** **Agreed.** Changed the unknown-tier-with-no-fallback
+  behaviour from "throw `INVALID_TIER`" to "skip the request +
+  emit a `'rate-limit.skipped'` observation tagged with the
+  unknown tier name". Ops teams alert on a non-zero `skipped`
+  rate; the API doesn't 5xx on a config drift. Consumers who
+  prefer fail-loud semantics can still get them by passing
+  `fallback: someThrowingLimiter`. Updated §2.9 docblock, §5.1
+  table row, and §9.6 item 6. (PLAN.md §2.9, §5.1, §9.6.)

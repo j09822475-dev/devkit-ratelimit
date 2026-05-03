@@ -160,6 +160,7 @@
     "prepublishOnly": "npm run build && npm run publint && npm run attw && npm run size"
   },
   "peerDependencies": {
+    "@cloudflare/workers-types": ">=4.20240925 <5",
     "@sveltejs/kit": ">=2 <3",
     "@upstash/redis": ">=1.34 <2",
     "elysia": ">=1.1 <2",
@@ -169,6 +170,9 @@
     "next": ">=13.4 <16"
   },
   "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    },
     "@sveltejs/kit": {
       "optional": true
     },
@@ -223,7 +227,7 @@
     {
       "name": "core",
       "path": "dist/index.js",
-      "limit": "3 KB"
+      "limit": "3.2 KB"
     },
     {
       "name": "errors",
@@ -318,7 +322,7 @@
     {
       "name": "compose",
       "path": "dist/compose/index.js",
-      "limit": "0.6 KB"
+      "limit": "0.7 KB"
     }
   ],
   "publishConfig": {
