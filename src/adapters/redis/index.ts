@@ -69,12 +69,14 @@ export function createRedisStore(
   return {
     name: 'redis',
     async consume(key, spec, cost, now): Promise<ConsumeResult> {
+      assertWindowFitsRedis(spec);
       const args = buildArgs(spec, cost, now);
       const fullKey = keyPrefix + key;
       const reply = await evalScript(spec, fullKey, args);
       return parseReply(reply, spec);
     },
     async peek(key, spec, now): Promise<RateLimitState> {
+      assertWindowFitsRedis(spec);
       const args = buildArgs(spec, 0, now);
       const fullKey = keyPrefix + key;
       const reply = await evalScript(spec, fullKey, args);
@@ -167,6 +169,40 @@ function isNoScriptError(err: unknown): boolean {
     return err.message.toUpperCase().includes('NOSCRIPT');
   }
   return false;
+}
+
+// Redis PEXPIRE accepts a signed 32-bit millisecond TTL — the practical
+// ceiling is ~24.8 days, but the broadly-cited safe upper bound (used by
+// the official client docs) is 49.7 days for 64-bit `EXPIRE` targets.
+// We pick the conservative side so users on either path get the same
+// answer.
+const REDIS_MAX_WINDOW_MS = 49 * 86_400_000;
+
+function assertWindowFitsRedis(spec: AlgorithmSpec): void {
+  const w = windowOf(spec);
+  if (w > REDIS_MAX_WINDOW_MS) {
+    throw new RateLimitError(
+      'WINDOW_TOO_LARGE',
+      `redis: window/intervalMs ${w} exceeds Redis PEXPIRE ceiling (${REDIS_MAX_WINDOW_MS} ms ~= 49d)`,
+    );
+  }
+}
+
+function windowOf(spec: AlgorithmSpec): number {
+  switch (spec.kind) {
+    case 'token-bucket':
+    case 'leaky-bucket':
+      return spec.intervalMs;
+    case 'sliding-window-counter':
+    case 'sliding-window-log':
+    case 'fixed-window':
+      return spec.windowMs;
+    default: {
+      const exhaustive: never = spec;
+      void exhaustive;
+      return 0;
+    }
+  }
 }
 
 export type { RedisLike } from './client.js';

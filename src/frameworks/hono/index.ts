@@ -4,9 +4,10 @@
  * short-circuits with a 429 or merges the limiter's headers into the
  * downstream response.
  *
- * The adapter auto-detects `c.executionCtx` and switches the limiter's
- * `hookMode` to `'wait-until'` so observability hooks don't add to TTFB on
- * Workers / Vercel Edge.
+ * When the limiter is built with `hookMode: 'wait-until'` and `c.executionCtx`
+ * is available (Workers / Vercel Edge), the adapter rebinds the limiter
+ * via `limiter.withExecutionCtx(c.executionCtx)` so the observability hook
+ * runs through `executionCtx.waitUntil` and never adds to TTFB.
  */
 
 import type { RateLimiter } from '../../types/limiter.js';
@@ -46,13 +47,13 @@ export function honoRateLimit<K = undefined>(
   } = {},
 ) {
   return async (c: HonoContextLike<K>, next: HonoNext): Promise<Response | void> => {
-    // Wire executionCtx so the limiter's hooks can use waitUntil. We do
-    // not mutate the limiter; the runConsume path consults `cfg.executionCtx`
-    // from the frozen config; the bare middleware path stays on
-    // fire-and-forget since we cannot mutate the cfg post-hoc. Adapters
-    // that *want* wait-until set `hookMode: 'wait-until'` at construction
-    // and pass `executionCtx` into the limiter's config directly.
-    const result = await limiter.check(c.req.raw);
+    // Per-request rebind so observability hooks can use `waitUntil`. The
+    // clone is cheap (frozen config swap; no normalisation), and only
+    // produced when an executionCtx is actually present. Limiters built
+    // without `hookMode: 'wait-until'` see no behaviour change.
+    const scoped =
+      c.executionCtx !== undefined ? limiter.withExecutionCtx(c.executionCtx) : limiter;
+    const result = await scoped.check(c.req.raw);
     c.set('rateLimit', result as unknown);
     if (!result.allowed) {
       if (opts.onLimit !== undefined) return opts.onLimit(c);

@@ -61,10 +61,6 @@ export function composeAll(limiters: readonly RateLimiter<unknown>[]): RateLimit
     }
     // Every layer allowed — return the most restrictive remaining count
     // for the result, with merged headers.
-    const last = allowed.at(-1);
-    if (last === undefined) {
-      throw new RateLimitError('INVALID_CONFIG', 'composeAll: empty allowed set');
-    }
     const tightest = allowed.reduce((acc, cur) =>
       cur.state.remaining < acc.state.remaining ? cur : acc,
     );
@@ -105,6 +101,15 @@ export function composeAll(limiters: readonly RateLimiter<unknown>[]): RateLimit
     };
   }
 
+  function withExecutionCtx(
+    executionCtx: { waitUntil(p: Promise<unknown>): void },
+  ): RateLimiter<unknown> {
+    // Recompose with each layer rebound. Each layer's clone is cheap
+    // (frozen-config swap), so the per-request overhead is bounded by
+    // the layer count.
+    return composeAll(limiters.map((l) => l.withExecutionCtx(executionCtx)));
+  }
+
   // Use the first limiter's config as the surface; downstream code
   // typically reads only `prefix` / `algorithm.kind` and a composed
   // limiter's "primary" identity is the first layer.
@@ -118,6 +123,7 @@ export function composeAll(limiters: readonly RateLimiter<unknown>[]): RateLimit
     reset,
     resetKey,
     middleware,
+    withExecutionCtx,
     config: primary.config as RateLimiter<unknown>['config'],
   });
 }

@@ -113,8 +113,19 @@ end
 if count + cost > limit then
   return {0, math.max(0, limit - count), reset, reset - now}
 end
+-- Build a unique-per-call suffix from a server-side counter (INCR is
+-- atomic) plus the high-resolution microsecond field of TIME. Cluster
+-- replication reseeds Lua's PRNG per-call for determinism, so two
+-- concurrent EVAL invocations at the same millisecond CAN draw
+-- identical math.random() values and collide on ZADD (the duplicate is
+-- then a silent no-op and the bucket undercounts). The seq + microsecond
+-- combination cannot collide between concurrent calls.
+local seq = redis.call('INCR', KEYS[1] .. ':seq')
+redis.call('PEXPIRE', KEYS[1] .. ':seq', window + 1000)
+local t = redis.call('TIME')
+local micros = t[2]
 for i = 1, cost do
-  redis.call('ZADD', KEYS[1], now, now .. ':' .. i .. ':' .. math.random())
+  redis.call('ZADD', KEYS[1], now, now .. ':' .. seq .. ':' .. i .. ':' .. micros)
 end
 redis.call('PEXPIRE', KEYS[1], window + 1000)
 return {1, math.max(0, limit - (count + cost)), reset, 0}

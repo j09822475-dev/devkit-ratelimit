@@ -8,6 +8,7 @@
 import { RateLimitError } from '../errors/base.js';
 import { build429Response } from '../core/response.js';
 import { buildHeaders } from '../core/headers.js';
+import type { HeaderStyle } from '../types/headers.js';
 import type { RateLimiter, RateLimiterMiddleware } from '../types/limiter.js';
 import type { RateLimitResult, RateLimitState } from '../types/result.js';
 
@@ -51,15 +52,23 @@ export function tieredRateLimiter<Tier extends string>(opts: {
     return null;
   }
 
-  function syntheticAllowed<K>(state: RateLimitState): RateLimitResult<K> {
+  function syntheticAllowed<K>(state: RateLimitState, style: HeaderStyle, now: number): RateLimitResult<K> {
     return {
       allowed: true,
       key: '',
       state,
-      headers: buildHeaders(state, 'rfc'),
+      headers: buildHeaders(state, style, now),
       degraded: false,
       context: undefined as K,
     };
+  }
+
+  // For the no-tier-matched synthetic path we mirror the headerStyle of
+  // whichever limiter would have been picked first, so clients don't see
+  // mixed RFC/legacy header shapes between consume and skip paths.
+  function defaultStyle(): HeaderStyle {
+    const first = Object.values<RateLimiter<unknown>>(opts.tiers)[0] ?? opts.fallback;
+    return first?.config.headerStyle ?? 'rfc';
   }
 
   async function check(
@@ -68,12 +77,12 @@ export function tieredRateLimiter<Tier extends string>(opts: {
   ): Promise<RateLimitResult<unknown>> {
     const limiter = await pick(req);
     if (limiter === null) {
-      return syntheticAllowed<unknown>({
-        limit: 0,
-        remaining: 0,
-        reset: Date.now(),
-        retryAfter: 0,
-      });
+      const now = Date.now();
+      return syntheticAllowed<unknown>(
+        { limit: 0, remaining: 0, reset: now, retryAfter: 0 },
+        defaultStyle(),
+        now,
+      );
     }
     return limiter.check(req, opts2);
   }
@@ -81,12 +90,12 @@ export function tieredRateLimiter<Tier extends string>(opts: {
   async function peek(req: Request): Promise<RateLimitResult<unknown>> {
     const limiter = await pick(req);
     if (limiter === null) {
-      return syntheticAllowed<unknown>({
-        limit: 0,
-        remaining: 0,
-        reset: Date.now(),
-        retryAfter: 0,
-      });
+      const now = Date.now();
+      return syntheticAllowed<unknown>(
+        { limit: 0, remaining: 0, reset: now, retryAfter: 0 },
+        defaultStyle(),
+        now,
+      );
     }
     return limiter.peek(req);
   }
@@ -113,6 +122,24 @@ export function tieredRateLimiter<Tier extends string>(opts: {
     };
   }
 
+  function withExecutionCtx(
+    executionCtx: { waitUntil(p: Promise<unknown>): void },
+  ): RateLimiter<unknown> {
+    const reboundTiers = Object.fromEntries(
+      Object.entries<RateLimiter<unknown>>(opts.tiers).map(([k, v]) => [
+        k,
+        v.withExecutionCtx(executionCtx),
+      ]),
+    ) as Readonly<Record<Tier, RateLimiter<unknown>>>;
+    return tieredRateLimiter<Tier>({
+      resolve: opts.resolve,
+      tiers: reboundTiers,
+      ...(opts.fallback !== undefined
+        ? { fallback: opts.fallback.withExecutionCtx(executionCtx) }
+        : {}),
+    });
+  }
+
   const primary =
     (Object.values<RateLimiter<unknown>>(opts.tiers)[0]) ?? opts.fallback;
   if (primary === undefined) {
@@ -127,6 +154,7 @@ export function tieredRateLimiter<Tier extends string>(opts: {
     reset,
     resetKey,
     middleware,
+    withExecutionCtx,
     config: primary.config,
   });
 }

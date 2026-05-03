@@ -15,13 +15,17 @@ import type { RateLimitState } from '../types/result.js';
  *
  * @param state Live rate-limit state.
  * @param style Header style.
+ * @param now   Wall-clock milliseconds — supplied by the limiter so the
+ *              `RateLimit: reset=…` and `RateLimit-Policy: w=…` values
+ *              honour the configured `clock`. Required for deterministic
+ *              tests and clock-dependent fixtures.
  * @returns     A fresh `Headers` object.
  */
-export function buildHeaders(state: RateLimitState, style: HeaderStyle): Headers {
+export function buildHeaders(state: RateLimitState, style: HeaderStyle, now: number): Headers {
   const h = new Headers();
   if (style === 'none') return h;
 
-  const resetSeconds = Math.max(0, Math.ceil((state.reset - Date.now()) / 1000));
+  const resetSeconds = Math.max(0, Math.ceil((state.reset - now) / 1000));
 
   if (style === 'rfc' || style === 'both') {
     // draft-ietf-httpapi-ratelimit-headers-10 uses RFC 8941 structured
@@ -31,7 +35,7 @@ export function buildHeaders(state: RateLimitState, style: HeaderStyle): Headers
       'RateLimit',
       `limit=${state.limit}, remaining=${state.remaining}, reset=${resetSeconds}`,
     );
-    h.set('RateLimit-Policy', `${state.limit};w=${Math.ceil(windowSeconds(state))}`);
+    h.set('RateLimit-Policy', `${state.limit};w=${Math.ceil(windowSeconds(state, now))}`);
   }
 
   if (style === 'legacy' || style === 'both') {
@@ -53,13 +57,13 @@ export function buildHeaders(state: RateLimitState, style: HeaderStyle): Headers
 /**
  * Best-effort window length for the `RateLimit-Policy` `w=` parameter.
  * For algorithms that don't have a "window" (token bucket, leaky bucket)
- * we use `(reset - now) + retryAfter` as the inferred period.
+ * we use `(reset - now)` as the inferred period.
  *
  * @param state Live state.
+ * @param now   Wall-clock milliseconds.
  * @returns     Window length in seconds.
  */
-function windowSeconds(state: RateLimitState): number {
-  const now = Date.now();
+function windowSeconds(state: RateLimitState, now: number): number {
   const span = Math.max(state.reset - now, 1);
   return Math.max(1, Math.round(span / 1000));
 }

@@ -54,6 +54,14 @@ export class RateLimitDurableObject {
         { status: 400 },
       );
     }
+    // Defence-in-depth: the stub deserialises a plain object that has the
+    // shape but not the algorithm-spec brand (the brand is a non-enumerable
+    // symbol that does not survive JSON). Validate the structural fields
+    // here so a misbehaving caller cannot push e.g. `capacity: -1` into
+    // the algorithm dispatch.
+    if (typeof body.op !== 'string' || typeof body.key !== 'string' || body.key === '') {
+      return Response.json({ error: 'invalid op/key' }, { status: 400 });
+    }
     if (body.op === 'reset') {
       const existed = await this.state.storage.delete(body.key);
       return Response.json({ existed });
@@ -61,8 +69,18 @@ export class RateLimitDurableObject {
     if (body.spec === undefined || body.now === undefined) {
       return Response.json({ error: 'missing spec/now' }, { status: 400 });
     }
+    const specError = validateSpec(body.spec);
+    if (specError !== null) {
+      return Response.json({ error: specError }, { status: 400 });
+    }
+    if (!Number.isFinite(body.now)) {
+      return Response.json({ error: 'invalid now' }, { status: 400 });
+    }
     if (body.op === 'consume') {
       const cost = body.cost ?? 1;
+      if (!Number.isFinite(cost) || cost < 0) {
+        return Response.json({ error: 'invalid cost' }, { status: 400 });
+      }
       const result = await this.consumeImpl(body.key, body.spec, cost, body.now);
       return Response.json(result);
     }
@@ -103,6 +121,42 @@ export class RateLimitDurableObject {
       return this.state.blockConcurrencyWhile(apply);
     }
     return apply();
+  }
+}
+
+/**
+ * Structural validation of a DO request body's `spec` field. The brand
+ * symbol on `AlgorithmSpec` does not survive JSON serialisation, so the
+ * DO can't trust it — we re-check that `kind` is one of the known
+ * variants and that every numeric field is finite and positive.
+ *
+ * Returns `null` on success or a short error string suitable for the
+ * 400 response.
+ */
+function validateSpec(spec: AlgorithmSpec): string | null {
+  const isPositiveFinite = (n: unknown): n is number =>
+    typeof n === 'number' && Number.isFinite(n) && n > 0;
+  switch (spec.kind) {
+    case 'fixed-window':
+    case 'sliding-window-counter':
+    case 'sliding-window-log':
+      return isPositiveFinite(spec.limit) && isPositiveFinite(spec.windowMs)
+        ? null
+        : 'invalid window spec';
+    case 'token-bucket':
+      return isPositiveFinite(spec.capacity) &&
+        isPositiveFinite(spec.refill) &&
+        isPositiveFinite(spec.intervalMs)
+        ? null
+        : 'invalid token-bucket spec';
+    case 'leaky-bucket':
+      return isPositiveFinite(spec.capacity) &&
+        isPositiveFinite(spec.leak) &&
+        isPositiveFinite(spec.intervalMs)
+        ? null
+        : 'invalid leaky-bucket spec';
+    default:
+      return 'unknown algorithm kind';
   }
 }
 

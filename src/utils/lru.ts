@@ -53,6 +53,19 @@ export class Lru<K, V> {
   }
 
   /**
+   * Look up a value WITHOUT promoting it to the MRU position. Use this
+   * for read-only inspection (e.g. the memory store's `peek`) so an idle
+   * key being polled doesn't artificially keep itself alive and evict
+   * actually-active keys.
+   *
+   * @param key Key to look up.
+   * @returns   The associated value, or `undefined`.
+   */
+  peek(key: K): V | undefined {
+    return this.map.get(key)?.value;
+  }
+
+  /**
    * Insert or update a value. Updating refreshes its MRU position.
    * Inserting beyond `maxSize` evicts the LRU entry.
    *

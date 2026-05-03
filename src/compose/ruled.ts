@@ -6,6 +6,7 @@
 import { RateLimitError } from '../errors/base.js';
 import { build429Response } from '../core/response.js';
 import { buildHeaders } from '../core/headers.js';
+import type { HeaderStyle } from '../types/headers.js';
 import type { RateLimiter, RateLimiterMiddleware } from '../types/limiter.js';
 import type { RateLimitResult } from '../types/result.js';
 
@@ -58,18 +59,26 @@ export function ruledRateLimiter(opts: {
     return opts.fallback ?? null;
   }
 
+  // For the no-rule-matched synthetic path we mirror the headerStyle of
+  // whichever limiter would have been picked first, so clients don't see
+  // mixed RFC/legacy header shapes between consume and skip paths.
+  function defaultStyle(): HeaderStyle {
+    return opts.rules[0]?.use.config.headerStyle ?? opts.fallback?.config.headerStyle ?? 'rfc';
+  }
+
   async function check(
     req: Request,
     opts2?: { cost?: number },
   ): Promise<RateLimitResult<unknown>> {
     const limiter = await pick(req);
     if (limiter === null) {
-      const state = { limit: 0, remaining: 0, reset: Date.now(), retryAfter: 0 };
+      const now = Date.now();
+      const state = { limit: 0, remaining: 0, reset: now, retryAfter: 0 };
       return {
         allowed: true,
         key: '',
         state,
-        headers: buildHeaders(state, 'rfc'),
+        headers: buildHeaders(state, defaultStyle(), now),
         degraded: false,
         context: undefined,
       };
@@ -80,12 +89,13 @@ export function ruledRateLimiter(opts: {
   async function peek(req: Request): Promise<RateLimitResult<unknown>> {
     const limiter = await pick(req);
     if (limiter === null) {
-      const state = { limit: 0, remaining: 0, reset: Date.now(), retryAfter: 0 };
+      const now = Date.now();
+      const state = { limit: 0, remaining: 0, reset: now, retryAfter: 0 };
       return {
         allowed: true,
         key: '',
         state,
-        headers: buildHeaders(state, 'rfc'),
+        headers: buildHeaders(state, defaultStyle(), now),
         degraded: false,
         context: undefined,
       };
@@ -113,6 +123,17 @@ export function ruledRateLimiter(opts: {
     };
   }
 
+  function withExecutionCtx(
+    executionCtx: { waitUntil(p: Promise<unknown>): void },
+  ): RateLimiter<unknown> {
+    return ruledRateLimiter({
+      rules: opts.rules.map((r) => ({ when: r.when, use: r.use.withExecutionCtx(executionCtx) })),
+      ...(opts.fallback !== undefined
+        ? { fallback: opts.fallback.withExecutionCtx(executionCtx) }
+        : {}),
+    });
+  }
+
   const primary = opts.rules[0]?.use ?? opts.fallback;
   if (primary === undefined) {
     throw new RateLimitError(
@@ -126,6 +147,7 @@ export function ruledRateLimiter(opts: {
     reset,
     resetKey,
     middleware,
+    withExecutionCtx,
     config: primary.config,
   });
 }

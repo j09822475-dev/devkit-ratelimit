@@ -36,7 +36,12 @@ export type SvelteKitHandle = (input: {
  */
 export function rateLimitHandle<K = undefined>(limiter: RateLimiter<K>): SvelteKitHandle {
   return async ({ event, resolve }) => {
-    const result = await limiter.check(event.request);
+    // Adapter binding (Vercel / Cloudflare) surfaces `executionCtx` on
+    // `event.platform?.context` — rebind the limiter per request so
+    // `hookMode: 'wait-until'` actually fires through `waitUntil`.
+    const ctx = event.platform?.context;
+    const scoped = ctx !== undefined ? limiter.withExecutionCtx(ctx) : limiter;
+    const result = await scoped.check(event.request);
     event.locals['rateLimit'] = result;
     if (!result.allowed) {
       return new Response('Too Many Requests', {

@@ -78,10 +78,13 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): RateLimitStore
   return {
     name: 'memory',
     async consume(key, spec, cost, now): Promise<ConsumeResult> {
-      return consumeImpl(lru, key, spec, cost, now);
+      return consumeImpl(lru, key, spec, cost, now, false);
     },
     async peek(key, spec, now): Promise<RateLimitState> {
-      const r = consumeImpl(lru, key, spec, 0, now);
+      // `peek` MUST NOT mutate state — that includes the LRU's MRU order.
+      // The `readOnly` flag tells the per-algorithm runners to use
+      // `lru.peek` (no promotion) instead of `lru.get`.
+      const r = consumeImpl(lru, key, spec, 0, now, true);
       return { limit: r.limit, remaining: r.remaining, reset: r.reset, retryAfter: r.retryAfter };
     },
     async reset(key): Promise<boolean> {
@@ -134,14 +137,15 @@ function consumeImpl(
   spec: AlgorithmSpec,
   cost: number,
   now: number,
+  readOnly: boolean,
 ): ConsumeResult {
   switch (spec.kind) {
     case 'fixed-window':
-      return runFixedWindow(lru, key, spec.limit, spec.windowMs, cost, now);
+      return runFixedWindow(lru, key, spec.limit, spec.windowMs, cost, now, readOnly);
     case 'sliding-window-counter':
-      return runSlidingWindowCounter(lru, key, spec.limit, spec.windowMs, cost, now);
+      return runSlidingWindowCounter(lru, key, spec.limit, spec.windowMs, cost, now, readOnly);
     case 'sliding-window-log':
-      return runSlidingWindowLog(lru, key, spec.limit, spec.windowMs, cost, now);
+      return runSlidingWindowLog(lru, key, spec.limit, spec.windowMs, cost, now, readOnly);
     case 'token-bucket':
       return runTokenBucket(
         lru,
@@ -151,6 +155,7 @@ function consumeImpl(
         spec.intervalMs,
         cost,
         now,
+        readOnly,
       );
     case 'leaky-bucket':
       return runLeakyBucket(
@@ -161,6 +166,7 @@ function consumeImpl(
         spec.intervalMs,
         cost,
         now,
+        readOnly,
       );
     default: {
       const exhaustive: never = spec;
@@ -170,6 +176,20 @@ function consumeImpl(
   }
 }
 
+/**
+ * Read an entry from the LRU. `readOnly` selects between `peek` (no MRU
+ * promotion) and `get` (promotes to MRU). The store's `peek` method
+ * passes `readOnly: true` so a polling caller doesn't keep an idle key
+ * alive at the expense of evicting active ones.
+ */
+function readEntry(
+  lru: Lru<string, Entry>,
+  key: string,
+  readOnly: boolean,
+): Entry | undefined {
+  return readOnly ? lru.peek(key) : lru.get(key);
+}
+
 function runFixedWindow(
   lru: Lru<string, Entry>,
   key: string,
@@ -177,10 +197,11 @@ function runFixedWindow(
   windowMs: number,
   cost: number,
   now: number,
+  readOnly: boolean,
 ): ConsumeResult {
   const start = Math.floor(now / windowMs) * windowMs;
   const reset = start + windowMs;
-  const existing = lru.get(key);
+  const existing = readEntry(lru, key, readOnly);
   let count = 0;
   if (existing !== undefined && existing.kind === 'fixed-window' && existing.start === start) {
     count = existing.count;
@@ -227,12 +248,13 @@ function runSlidingWindowCounter(
   windowMs: number,
   cost: number,
   now: number,
+  readOnly: boolean,
 ): ConsumeResult {
   const start = Math.floor(now / windowMs) * windowMs;
   const reset = start + windowMs;
   let count = 0;
   let prev = 0;
-  const existing = lru.get(key);
+  const existing = readEntry(lru, key, readOnly);
   if (existing !== undefined && existing.kind === 'sliding-window-counter') {
     if (existing.start === start) {
       count = existing.count;
@@ -285,9 +307,10 @@ function runSlidingWindowLog(
   windowMs: number,
   cost: number,
   now: number,
+  readOnly: boolean,
 ): ConsumeResult {
   const cutoff = now - windowMs;
-  const existing = lru.get(key);
+  const existing = readEntry(lru, key, readOnly);
   let timestamps: number[] = [];
   if (existing !== undefined && existing.kind === 'sliding-window-log') {
     timestamps = existing.timestamps;
@@ -345,8 +368,9 @@ function runTokenBucket(
   intervalMs: number,
   cost: number,
   now: number,
+  readOnly: boolean,
 ): ConsumeResult {
-  const existing = lru.get(key);
+  const existing = readEntry(lru, key, readOnly);
   let level = capacity;
   let updatedAt = now;
   if (existing !== undefined && existing.kind === 'token-bucket') {
@@ -411,8 +435,9 @@ function runLeakyBucket(
   intervalMs: number,
   cost: number,
   now: number,
+  readOnly: boolean,
 ): ConsumeResult {
-  const existing = lru.get(key);
+  const existing = readEntry(lru, key, readOnly);
   let level = 0;
   let updatedAt = now;
   if (existing !== undefined && existing.kind === 'leaky-bucket') {

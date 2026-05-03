@@ -118,7 +118,15 @@ function normaliseConfig<K>(
   const message = config.message ?? 'Too Many Requests';
   const failOpen = config.failOpen ?? false;
   const cost = config.cost ?? 1;
-  assertValidCost(cost);
+  // The construction-time default cost MUST be > 0 — a default of 0 would
+  // turn every `check()` into a no-op consume. Per-call overrides MAY be
+  // 0 (peek-like), validated separately at the call site.
+  if (!Number.isFinite(cost) || cost <= 0) {
+    throw new RateLimitError(
+      'INVALID_CONFIG',
+      `cost (default per-call) must be > 0, got ${String(cost)}`,
+    );
+  }
   const hookMode = config.hookMode ?? DEFAULT_HOOK_MODE;
   const hookTimeoutMs = config.hookTimeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS;
   const clock = config.clock ?? nowMs;
@@ -166,7 +174,12 @@ interface ExtractedKey<K> {
  * Build the `KeyGeneratorContext` from a `Request`. Cloudflare workers
  * attach `cf` directly to the request (non-standard but ubiquitous on
  * Workers); we read it defensively without typing the shape — adapters
- * always pass the Web-Standard `Request`.
+ * always pass the Web-Standard `Request`. The carve-out for the unbranded
+ * `as` cast is documented here: there is no Web-Standard typing for
+ * `Request.cf` and we already restrict the cast to the single property
+ * we read, so the alternative — moving this helper to `core/key.ts` to
+ * inherit that file's broader Biome carve-out — would actually widen the
+ * surface.
  */
 function buildKeyGeneratorContext(req: Request): KeyGeneratorContext {
   const cf = (req as { cf?: { connectingIp?: unknown } }).cf;
@@ -243,7 +256,7 @@ function buildSkippedResult<K>(cfg: NormalisedRateLimitConfig<K>, now: number): 
     allowed: true,
     key: '',
     state,
-    headers: buildHeaders(state, cfg.headerStyle),
+    headers: buildHeaders(state, cfg.headerStyle, now),
     degraded: false,
     context: undefined as K,
   };
@@ -265,34 +278,54 @@ function buildDegradedResult<K>(
  * Emit an observation event. Honours `hookMode`. Errors thrown by the
  * hook are always swallowed.
  *
+ * Returns the in-flight promise only for `'sync'` mode — other modes
+ * detach the work and resolve immediately. Callers that need
+ * `'sync'` to actually be synchronous MUST await the returned promise
+ * (see {@link maybeAwaitObservation}).
+ *
  * @internal
  */
-async function emitObservation<K>(
+function emitObservation<K>(
   cfg: NormalisedRateLimitConfig<K>,
   event: RateLimitObservation<K>,
 ): Promise<void> {
   const hook = cfg.on;
-  if (hook === undefined) return;
+  if (hook === undefined) return Promise.resolve();
   if (cfg.hookMode === 'fire-and-forget') {
     queueMicrotask(() => {
       // We use a void IIFE so no caller awaits the promise; rejections
       // are caught and silently dropped per the contract.
       void runHookSafely(hook, event);
     });
-    return;
+    return Promise.resolve();
   }
   if (cfg.hookMode === 'wait-until') {
     const ctx = cfg.executionCtx;
     if (ctx !== undefined) {
       ctx.waitUntil(runHookSafely(hook, event));
-      return;
+      return Promise.resolve();
     }
     // Fall back to fire-and-forget when no executionCtx is wired.
     queueMicrotask(() => void runHookSafely(hook, event));
-    return;
+    return Promise.resolve();
   }
-  // 'sync'
-  await runHookSafelyBounded(hook, event, cfg.hookTimeoutMs);
+  // 'sync' — bounded, awaited inline by the caller.
+  return runHookSafelyBounded(hook, event, cfg.hookTimeoutMs);
+}
+
+/**
+ * Await an emitted observation only when `hookMode === 'sync'`. For
+ * `'fire-and-forget'` and `'wait-until'` the work has already been
+ * scheduled and the promise resolves immediately — awaiting it is a
+ * no-op but harmless.
+ *
+ * @internal
+ */
+async function maybeAwaitObservation<K>(
+  cfg: NormalisedRateLimitConfig<K>,
+  p: Promise<void>,
+): Promise<void> {
+  if (cfg.hookMode === 'sync') await p;
 }
 
 async function runHookSafely<K>(
@@ -409,41 +442,33 @@ export function createRateLimiter<K = undefined>(
     const startedAt = cfg.clock();
     const extracted = await extractKey(req, cfg);
     const now = cfg.clock();
-    if (extracted === SKIP) {
-      const result = buildSkippedResult(cfg, now);
-      void emitObservation(
+
+    // Single emit closure — closes over the values shared by every code
+    // path below. Returns the promise so callers can `await` under
+    // `hookMode === 'sync'` (the wrapper handles the dispatch).
+    const emit = (
+      type: RateLimitObservation<K>['type'],
+      key: string,
+      state: RateLimitState,
+      context: K,
+      error?: RateLimitError,
+    ): Promise<void> =>
+      maybeAwaitObservation(
         cfg,
-        buildObservation(
-          'rate-limit.skipped',
-          '',
-          result.state,
+        emitObservation(
           cfg,
-          cost,
-          startedAt,
-          now,
-          req,
-          undefined as K,
+          buildObservation(type, key, state, cfg, cost, startedAt, now, req, context, error),
         ),
       );
+
+    if (extracted === SKIP) {
+      const result = buildSkippedResult(cfg, now);
+      await emit('rate-limit.skipped', '', result.state, undefined as K);
       return result;
     }
     if ('degraded' in extracted) {
       const result = buildDegradedResult(cfg, now);
-      void emitObservation(
-        cfg,
-        buildObservation(
-          'rate-limit.error',
-          '',
-          result.state,
-          cfg,
-          cost,
-          startedAt,
-          now,
-          req,
-          undefined as K,
-          extracted.error,
-        ),
-      );
+      await emit('rate-limit.error', '', result.state, undefined as K, extracted.error);
       return result;
     }
 
@@ -459,26 +484,18 @@ export function createRateLimiter<K = undefined>(
       );
     } catch (err) {
       const wrapped = RateLimitError.is(err) ? err : wrapStoreError(err, cfg.store);
-      void emitObservation(
-        cfg,
-        buildObservation(
-          'rate-limit.error',
-          extracted.storeKey,
-          { limit: 0, remaining: 0, reset: now, retryAfter: 0 },
-          cfg,
-          cost,
-          startedAt,
-          now,
-          req,
-          extracted.context,
-          wrapped,
-        ),
+      await emit(
+        'rate-limit.error',
+        extracted.storeKey,
+        { limit: 0, remaining: 0, reset: now, retryAfter: 0 },
+        extracted.context,
+        wrapped,
       );
       throw wrapped;
     }
 
     const state = asState(consumeResult);
-    const headers = buildHeaders(state, cfg.headerStyle);
+    const headers = buildHeaders(state, cfg.headerStyle, now);
     const result: RateLimitResult<K> = {
       allowed: consumeResult.allowed,
       key: extracted.storeKey,
@@ -492,20 +509,7 @@ export function createRateLimiter<K = undefined>(
       : consumeResult.allowed
         ? 'rate-limit.allowed'
         : 'rate-limit.blocked';
-    void emitObservation(
-      cfg,
-      buildObservation(
-        type,
-        extracted.storeKey,
-        state,
-        cfg,
-        cost,
-        startedAt,
-        now,
-        req,
-        extracted.context,
-      ),
-    );
+    await emit(type, extracted.storeKey, state, extracted.context);
     return result;
   }
 
@@ -525,7 +529,7 @@ export function createRateLimiter<K = undefined>(
       cfg.failOpen,
     );
     const state = asState(peekResult);
-    const headers = buildHeaders(state, cfg.headerStyle);
+    const headers = buildHeaders(state, cfg.headerStyle, now);
     return {
       allowed: true,
       key: extracted.storeKey,
@@ -580,24 +584,40 @@ export function createRateLimiter<K = undefined>(
         // Builder threw — fall back to the default plain-text 429 and
         // emit an error observation so ops can alert on the bug.
         const now = cfg.clock();
-        void emitObservation(
+        await maybeAwaitObservation(
           cfg,
-          buildObservation(
-            'rate-limit.error',
-            result.key,
-            result.state,
+          emitObservation(
             cfg,
-            cfg.cost,
-            now,
-            now,
-            req,
-            result.context,
-            new RateLimitError('INVALID_CONFIG', 'responseBuilder threw', err),
+            buildObservation(
+              'rate-limit.error',
+              result.key,
+              result.state,
+              cfg,
+              cfg.cost,
+              now,
+              now,
+              req,
+              result.context,
+              new RateLimitError('INVALID_CONFIG', 'responseBuilder threw', err),
+            ),
           ),
         );
         return build429Response(result, cfg.message);
       }
     };
+  }
+
+  function withExecutionCtx(
+    executionCtx: { waitUntil(p: Promise<unknown>): void },
+  ): RateLimiter<K> {
+    // Re-frame the existing config rather than re-running normaliseConfig.
+    // We rebuild the limiter with the same store and algorithm so the
+    // returned handle's hot path is identical — the only difference is
+    // the executionCtx baked into the frozen config.
+    return createRateLimiter<K>({
+      ...cfg,
+      executionCtx,
+    } as RateLimitConfig<K>);
   }
 
   const handle: RateLimiter<K> = Object.freeze<RateLimiter<K>>({
@@ -606,6 +626,7 @@ export function createRateLimiter<K = undefined>(
     reset,
     resetKey,
     middleware,
+    withExecutionCtx,
     config: cfg,
   });
   return handle;

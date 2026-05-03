@@ -1,12 +1,17 @@
 /**
  * Cloudflare KV store — eventually consistent, ≤60 s global staleness
- * window per CF docs. Uses `get(..., { type: 'json' })` + conditional
- * `put` with a CAS metadata token; under contention this degrades to
- * "best-effort" with documented worst-case overshoot of ~1 per region.
+ * window per CF docs. Workers KV exposes no conditional-put primitive,
+ * so the adapter does a best-effort `get → mutate → put` with a bounded
+ * retry loop on transport errors only. Two concurrent consumes from the
+ * same colocation can both read level N and both write level N+1; under
+ * heavy contention worst-case overshoot is `concurrentRequests` per
+ * region (NOT the ~1 the original draft claimed).
  *
  * Use this only when "approximately N per minute, somewhere in the
  * world" is acceptable. For billing- or security-critical quotas use
- * `createDurableObjectStore` instead.
+ * `createDurableObjectStore` instead — Durable Objects serialise per-key
+ * RPCs by the runtime's actor model and give you a true consistency
+ * guarantee.
  */
 
 import { RateLimitError } from '../../errors/base.js';
@@ -32,18 +37,18 @@ export interface KVLike {
   delete(key: string): Promise<void>;
 }
 
-interface KVEntry {
-  // Algorithm kind discriminator persisted alongside data so we can detect
-  // mismatched specs across re-deploys with a different algorithm.
-  k: AlgorithmSpec['kind'];
-  // Counters / bucket levels are stored uniformly as a Number.
-  l: number;
-  p: number;
-  s: number;
-  ts: number[];
-  level: number;
-  updatedAt: number;
-}
+/**
+ * Discriminated-union KV entry. Each variant persists ONLY the fields its
+ * algorithm needs, so we don't pay for `ts: []` on every token-bucket
+ * write or `level: 0` on every fixed-window write. KV charges by stored
+ * bytes; trimming pays off across millions of keys.
+ */
+type KVEntry =
+  | { k: 'fixed-window'; l: number; s: number }
+  | { k: 'sliding-window-counter'; l: number; p: number; s: number }
+  | { k: 'sliding-window-log'; ts: number[] }
+  | { k: 'token-bucket'; level: number; updatedAt: number }
+  | { k: 'leaky-bucket'; level: number; updatedAt: number };
 
 /**
  * Configuration options for {@link createKVStore}.
@@ -51,7 +56,11 @@ interface KVEntry {
 export interface KVStoreOptions {
   /** Optional adapter-level key prefix. */
   readonly keyPrefix?: string;
-  /** CAS retry count on metadata mismatch. Default 3. */
+  /**
+   * Bounded retry count for transport-level `put` failures. Default 3.
+   * KV exposes no CAS primitive, so retries do NOT serialise concurrent
+   * writers — they only paper over transient network failures.
+   */
   readonly retries?: number;
 }
 
@@ -69,9 +78,11 @@ export function createKVStore(kv: KVLike, opts: KVStoreOptions = {}): RateLimitS
   return {
     name: 'kv',
     async consume(key, spec, cost, now): Promise<ConsumeResult> {
-      return runWithCas(kv, keyPrefix + key, spec, cost, now, retries);
+      assertWindowFitsKV(spec);
+      return runBestEffort(kv, keyPrefix + key, spec, cost, now, retries);
     },
     async peek(key, spec, now): Promise<RateLimitState> {
+      assertWindowFitsKV(spec);
       const fullKey = keyPrefix + key;
       let entry: KVEntry | null = null;
       try {
@@ -93,7 +104,13 @@ export function createKVStore(kv: KVLike, opts: KVStoreOptions = {}): RateLimitS
   };
 }
 
-async function runWithCas(
+/**
+ * Best-effort `get → mutate → put` with bounded retry on transport
+ * errors. KV exposes no CAS primitive; the retry only papers over
+ * transient `put` failures. Concurrent writers are NOT serialised — see
+ * the file-level docblock for the consistency caveat.
+ */
+async function runBestEffort(
   kv: KVLike,
   key: string,
   spec: AlgorithmSpec,
@@ -117,8 +134,8 @@ async function runWithCas(
       await kv.put(key, JSON.stringify(next), { expirationTtl: ttlSec });
       return lastResult;
     } catch (err) {
-      // KV writes don't have a true CAS; we treat any error as a transient
-      // race and retry. After `retries` we accept the best-effort result.
+      // Transport-level put failure (KV throws on network errors). Retry
+      // up to `retries`, then surface as STORE_UNAVAILABLE.
       if (i === retries) {
         throw new RateLimitError('STORE_UNAVAILABLE', 'kv: put failed', err);
       }
@@ -149,6 +166,22 @@ function specWindowMs(spec: AlgorithmSpec): number {
       void exhaustive;
       return 0;
     }
+  }
+}
+
+// Cloudflare KV `expirationTtl` caps at 365 days. The adapter doubles
+// the window when computing the TTL (so a fresh write outlives the
+// algorithm's usable horizon); we therefore cap the input window at
+// half that ceiling so we never produce an unrepresentable TTL.
+const KV_MAX_WINDOW_MS = 180 * 86_400_000;
+
+function assertWindowFitsKV(spec: AlgorithmSpec): void {
+  const w = specWindowMs(spec);
+  if (w > KV_MAX_WINDOW_MS) {
+    throw new RateLimitError(
+      'WINDOW_TOO_LARGE',
+      `kv: window/intervalMs ${w} exceeds Cloudflare KV expirationTtl ceiling (${KV_MAX_WINDOW_MS} ms ~= 180d, half of the 365d KV cap to leave headroom for the doubled write TTL)`,
+    );
   }
 }
 
@@ -196,15 +229,6 @@ function applyAlgorithm(
   }
 }
 
-const EMPTY_ENTRY: Omit<KVEntry, 'k'> = {
-  l: 0,
-  p: 0,
-  s: 0,
-  ts: [],
-  level: 0,
-  updatedAt: 0,
-};
-
 function applyFixedWindow(
   limit: number,
   windowMs: number,
@@ -217,9 +241,8 @@ function applyFixedWindow(
   let count = 0;
   if (prev !== null && prev.k === 'fixed-window' && prev.s === start) count = prev.l;
   if (cost === 0) {
-    const next: KVEntry = { ...EMPTY_ENTRY, k: 'fixed-window', l: count, s: start };
     return {
-      next,
+      next: { k: 'fixed-window', l: count, s: start },
       result: {
         allowed: count < limit,
         limit,
@@ -230,9 +253,8 @@ function applyFixedWindow(
     };
   }
   if (count + cost > limit) {
-    const next: KVEntry = { ...EMPTY_ENTRY, k: 'fixed-window', l: count, s: start };
     return {
-      next,
+      next: { k: 'fixed-window', l: count, s: start },
       result: {
         allowed: false,
         limit,
@@ -243,9 +265,8 @@ function applyFixedWindow(
     };
   }
   const newCount = count + cost;
-  const next: KVEntry = { ...EMPTY_ENTRY, k: 'fixed-window', l: newCount, s: start };
   return {
-    next,
+    next: { k: 'fixed-window', l: newCount, s: start },
     result: {
       allowed: true,
       limit,
@@ -278,15 +299,8 @@ function applySlidingCounter(
   const elapsedFrac = (now - start) / windowMs;
   const approx = Math.floor(prevCount * (1 - elapsedFrac)) + cur;
   if (cost === 0) {
-    const next: KVEntry = {
-      ...EMPTY_ENTRY,
-      k: 'sliding-window-counter',
-      l: cur,
-      p: prevCount,
-      s: start,
-    };
     return {
-      next,
+      next: { k: 'sliding-window-counter', l: cur, p: prevCount, s: start },
       result: {
         allowed: approx < limit,
         limit,
@@ -297,15 +311,8 @@ function applySlidingCounter(
     };
   }
   if (approx + cost > limit) {
-    const next: KVEntry = {
-      ...EMPTY_ENTRY,
-      k: 'sliding-window-counter',
-      l: cur,
-      p: prevCount,
-      s: start,
-    };
     return {
-      next,
+      next: { k: 'sliding-window-counter', l: cur, p: prevCount, s: start },
       result: {
         allowed: false,
         limit,
@@ -317,15 +324,8 @@ function applySlidingCounter(
   }
   const newCur = cur + cost;
   const newApprox = Math.floor(prevCount * (1 - elapsedFrac)) + newCur;
-  const next: KVEntry = {
-    ...EMPTY_ENTRY,
-    k: 'sliding-window-counter',
-    l: newCur,
-    p: prevCount,
-    s: start,
-  };
   return {
-    next,
+    next: { k: 'sliding-window-counter', l: newCur, p: prevCount, s: start },
     result: {
       allowed: true,
       limit,
@@ -353,9 +353,8 @@ function applySlidingLog(
   const oldest = ts[0] ?? now;
   const reset = oldest + windowMs;
   if (cost === 0) {
-    const next: KVEntry = { ...EMPTY_ENTRY, k: 'sliding-window-log', ts };
     return {
-      next,
+      next: { k: 'sliding-window-log', ts },
       result: {
         allowed: ts.length < limit,
         limit,
@@ -366,9 +365,8 @@ function applySlidingLog(
     };
   }
   if (ts.length + cost > limit) {
-    const next: KVEntry = { ...EMPTY_ENTRY, k: 'sliding-window-log', ts };
     return {
-      next,
+      next: { k: 'sliding-window-log', ts },
       result: {
         allowed: false,
         limit,
@@ -379,9 +377,8 @@ function applySlidingLog(
     };
   }
   for (let i = 0; i < cost; i++) ts.push(now);
-  const next: KVEntry = { ...EMPTY_ENTRY, k: 'sliding-window-log', ts };
   return {
-    next,
+    next: { k: 'sliding-window-log', ts },
     result: {
       allowed: true,
       limit,
@@ -411,14 +408,8 @@ function applyTokenBucket(
   const settled = Math.min(capacity, level + refillAmount);
 
   if (cost === 0) {
-    const next: KVEntry = {
-      ...EMPTY_ENTRY,
-      k: 'token-bucket',
-      level: settled,
-      updatedAt: now,
-    };
     return {
-      next,
+      next: { k: 'token-bucket', level: settled, updatedAt: now },
       result: {
         allowed: true,
         limit: capacity,
@@ -429,15 +420,9 @@ function applyTokenBucket(
     };
   }
   if (settled < cost) {
-    const next: KVEntry = {
-      ...EMPTY_ENTRY,
-      k: 'token-bucket',
-      level: settled,
-      updatedAt: now,
-    };
     const wait = Math.ceil(((cost - settled) / refill) * intervalMs);
     return {
-      next,
+      next: { k: 'token-bucket', level: settled, updatedAt: now },
       result: {
         allowed: false,
         limit: capacity,
@@ -448,14 +433,8 @@ function applyTokenBucket(
     };
   }
   const newLevel = settled - cost;
-  const next: KVEntry = {
-    ...EMPTY_ENTRY,
-    k: 'token-bucket',
-    level: newLevel,
-    updatedAt: now,
-  };
   return {
-    next,
+    next: { k: 'token-bucket', level: newLevel, updatedAt: now },
     result: {
       allowed: true,
       limit: capacity,
@@ -484,14 +463,8 @@ function applyLeakyBucket(
   const leaked = (elapsed / intervalMs) * leak;
   const settled = Math.max(0, level - leaked);
   if (cost === 0) {
-    const next: KVEntry = {
-      ...EMPTY_ENTRY,
-      k: 'leaky-bucket',
-      level: settled,
-      updatedAt: now,
-    };
     return {
-      next,
+      next: { k: 'leaky-bucket', level: settled, updatedAt: now },
       result: {
         allowed: true,
         limit: capacity,
@@ -502,15 +475,9 @@ function applyLeakyBucket(
     };
   }
   if (settled + cost > capacity) {
-    const next: KVEntry = {
-      ...EMPTY_ENTRY,
-      k: 'leaky-bucket',
-      level: settled,
-      updatedAt: now,
-    };
     const wait = Math.ceil(((settled + cost - capacity) / leak) * intervalMs);
     return {
-      next,
+      next: { k: 'leaky-bucket', level: settled, updatedAt: now },
       result: {
         allowed: false,
         limit: capacity,
@@ -521,14 +488,8 @@ function applyLeakyBucket(
     };
   }
   const newLevel = settled + cost;
-  const next: KVEntry = {
-    ...EMPTY_ENTRY,
-    k: 'leaky-bucket',
-    level: newLevel,
-    updatedAt: now,
-  };
   return {
-    next,
+    next: { k: 'leaky-bucket', level: newLevel, updatedAt: now },
     result: {
       allowed: true,
       limit: capacity,

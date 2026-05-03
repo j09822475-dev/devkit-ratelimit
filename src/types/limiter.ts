@@ -79,6 +79,26 @@ export interface RateLimiter<K = undefined> {
   middleware(): RateLimiterMiddleware;
 
   /**
+   * Return a per-request clone of the limiter with `executionCtx` bound,
+   * so observability hooks fired during `check()` / `peek()` can use
+   * `executionCtx.waitUntil(...)` under `hookMode === 'wait-until'`.
+   *
+   * Framework adapters call this once per inbound request when they
+   * have access to a Cloudflare/Vercel `executionCtx` — the returned
+   * handle shares the underlying store and configuration but carries
+   * the request-scoped `executionCtx`. Cheap (no normalisation; just a
+   * shallow `Object.freeze` over the cloned config).
+   *
+   * @param executionCtx The runtime-provided execution context.
+   * @returns            A frozen, request-scoped {@link RateLimiter}.
+   * @example
+   *   // inside a Hono middleware
+   *   const scoped = limiter.withExecutionCtx(c.executionCtx);
+   *   const result = await scoped.check(c.req.raw);
+   */
+  withExecutionCtx(executionCtx: { waitUntil(p: Promise<unknown>): void }): RateLimiter<K>;
+
+  /**
    * The frozen, normalised configuration the limiter was constructed
    * with — exposed for observability and framework-adapter introspection.
    */

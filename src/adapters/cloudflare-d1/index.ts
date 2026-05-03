@@ -1,9 +1,11 @@
 /**
  * Cloudflare D1 store — strong consistency within a single D1 region.
- * Each algorithm uses an `INSERT … ON CONFLICT DO UPDATE` upsert to keep
- * read+modify+write atomic from the SQL engine's perspective. The schema
- * lives in `schema.sql`; users run it once via `wrangler d1 execute`
- * before first deploy.
+ * Each consume runs an optimistic-concurrency cycle: SELECT current row,
+ * compute the post-state in JS, then UPSERT with a guarded
+ * `WHERE updated_at = ? AND data = ?` clause that only fires when no
+ * concurrent writer has touched the row. A bounded retry loop handles
+ * the lost-race case. The schema lives in `schema.sql`; users run it
+ * once via `wrangler d1 execute` before first deploy.
  */
 
 import { RateLimitError } from '../../errors/base.js';
@@ -26,7 +28,7 @@ export interface D1Like {
 export interface D1PreparedStatementLike {
   bind(...values: (string | number | null)[]): D1PreparedStatementLike;
   first<T = unknown>(): Promise<T | null>;
-  run(): Promise<{ success: boolean }>;
+  run(): Promise<{ success: boolean; meta?: { changes?: number } }>;
 }
 
 /**
@@ -37,6 +39,11 @@ export interface D1StoreOptions {
   readonly table?: string;
   /** Optional adapter-level prefix. */
   readonly keyPrefix?: string;
+  /**
+   * Maximum optimistic-concurrency retries on a lost write race. Default 5.
+   * Exceeding throws `STORE_UNAVAILABLE`.
+   */
+  readonly maxRetries?: number;
 }
 
 interface PersistedRow {
@@ -61,6 +68,7 @@ interface PersistedRow {
 export function createD1Store(db: D1Like, opts: D1StoreOptions = {}): RateLimitStore {
   const table = sanitiseIdent(opts.table ?? 'ratelimit');
   const keyPrefix = opts.keyPrefix ?? '';
+  const maxRetries = opts.maxRetries ?? 5;
 
   async function loadRow(key: string): Promise<PersistedRow | null> {
     const row = await db
@@ -70,14 +78,29 @@ export function createD1Store(db: D1Like, opts: D1StoreOptions = {}): RateLimitS
     return row;
   }
 
-  async function upsertRow(row: PersistedRow): Promise<void> {
-    await db
+  // Optimistic-concurrency upsert. Returns `true` when the write was applied,
+  // `false` when a concurrent writer raced us (caller retries). The
+  // `WHERE updated_at = ? AND data = ?` guards a `DO UPDATE` so the
+  // post-state is only committed when the row is still in the snapshot we
+  // computed against.
+  async function casUpsert(
+    row: PersistedRow,
+    oldUpdatedAt: number,
+    oldData: string,
+  ): Promise<boolean> {
+    const r = await db
       .prepare(
         `INSERT INTO ${table} (key, kind, data, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET kind = excluded.kind, data = excluded.data, updated_at = excluded.updated_at`,
+         ON CONFLICT(key) DO UPDATE SET kind = excluded.kind, data = excluded.data, updated_at = excluded.updated_at
+         WHERE ${table}.updated_at = ? AND ${table}.data = ?`,
       )
-      .bind(row.key, row.kind, row.data, row.updated_at)
+      .bind(row.key, row.kind, row.data, row.updated_at, oldUpdatedAt, oldData)
       .run();
+    if (!r.success) return false;
+    const changes = r.meta?.changes;
+    // Workers' D1 always reports `changes` for write statements; fall back
+    // to `success` for mocks that don't expose `meta`.
+    return changes === undefined ? true : changes > 0;
   }
 
   return {
@@ -85,26 +108,38 @@ export function createD1Store(db: D1Like, opts: D1StoreOptions = {}): RateLimitS
     async consume(key, spec, cost, now): Promise<ConsumeResult> {
       assertPayloadSize(spec);
       const fullKey = keyPrefix + key;
-      let row: PersistedRow | null;
-      try {
-        row = await loadRow(fullKey);
-      } catch (err) {
-        throw new RateLimitError('STORE_UNAVAILABLE', 'd1: select failed', err);
-      }
-      const { result, next } = applyAlgorithm(spec, row, cost, now);
-      if (cost > 0) {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        let row: PersistedRow | null;
         try {
-          await upsertRow({
-            key: fullKey,
-            kind: spec.kind,
-            data: JSON.stringify(next),
-            updated_at: now,
-          });
+          row = await loadRow(fullKey);
+        } catch (err) {
+          throw new RateLimitError('STORE_UNAVAILABLE', 'd1: select failed', err);
+        }
+        const oldUpdatedAt = row?.updated_at ?? -1;
+        const oldData = row?.data ?? '';
+        const { result, next } = applyAlgorithm(spec, row, cost, now);
+        if (cost === 0) return result;
+        let won: boolean;
+        try {
+          won = await casUpsert(
+            {
+              key: fullKey,
+              kind: spec.kind,
+              data: JSON.stringify(next),
+              updated_at: now,
+            },
+            oldUpdatedAt,
+            oldData,
+          );
         } catch (err) {
           throw new RateLimitError('STORE_UNAVAILABLE', 'd1: upsert failed', err);
         }
+        if (won) return result;
       }
-      return result;
+      throw new RateLimitError(
+        'STORE_UNAVAILABLE',
+        `d1: write contention exceeded ${maxRetries} retries`,
+      );
     },
     async peek(key, spec, now): Promise<RateLimitState> {
       assertPayloadSize(spec);
@@ -144,7 +179,8 @@ export function createD1Store(db: D1Like, opts: D1StoreOptions = {}): RateLimitS
           .prepare(`DELETE FROM ${table} WHERE updated_at < ?`)
           .bind(cutoff)
           .run();
-        return r.success ? 1 : 0;
+        if (!r.success) return 0;
+        return r.meta?.changes ?? 0;
       } catch {
         return 0;
       }

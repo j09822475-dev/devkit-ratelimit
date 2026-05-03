@@ -74,6 +74,12 @@ export function composeFirstAllowed(
     };
   }
 
+  function withExecutionCtx(
+    executionCtx: { waitUntil(p: Promise<unknown>): void },
+  ): RateLimiter<unknown> {
+    return composeFirstAllowed(limiters.map((l) => l.withExecutionCtx(executionCtx)));
+  }
+
   const primary = limiters[0];
   if (primary === undefined) {
     throw new RateLimitError('INVALID_CONFIG', 'composeFirstAllowed: empty primary');
@@ -84,6 +90,7 @@ export function composeFirstAllowed(
     reset,
     resetKey,
     middleware,
+    withExecutionCtx,
     config: primary.config as RateLimiter<unknown>['config'],
   });
 }
