@@ -1,0 +1,76 @@
+# Source — only the compiled `dist/` ships
+src
+*.ts
+!*.d.ts
+
+# Tests / fixtures / sandbox
+__tests__
+**/__tests__
+**/*.test.ts
+**/*.test.js
+**/*.spec.ts
+**/*.spec.js
+**/*.bench.ts
+test
+tests
+examples
+sandbox
+fixtures
+coverage
+.nyc_output
+.vitest-cache
+
+# Tooling configs (not needed by consumers)
+tsconfig*.json
+vitest.config.ts
+vitest.config.js
+biome.json
+biome.jsonc
+.biomeignore
+size-limit.config.*
+.size-limit*
+.attw.json
+publint.config.*
+.changeset
+
+# Repo / CI / editor noise
+.git
+.github
+.gitignore
+.gitattributes
+.editorconfig
+.prettierrc*
+.eslintrc*
+.eslintignore
+.eslintcache
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build / framework caches
+.cache
+.turbo
+.next
+.nuxt
+.svelte-kit
+.wrangler
+.vercel
+.tsbuildinfo
+*.tsbuildinfo
+
+# Logs / env / secrets
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env
+.env.*
+*.pem
+
+# Internal docs not meant for npm consumers
+PLAN.md
+REVIEW.md

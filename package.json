@@ -1,0 +1,332 @@
+{
+  "name": "@devkit/ratelimit",
+  "version": "0.1.0",
+  "description": "Universal, zero-dependency, edge-runtime-native rate limiter on Web Standard Request/Response. ~6KB core, runs in Node 20+, Bun, Deno, Cloudflare Workers and Vercel Edge. Five algorithms (sliding window, sliding window log, token bucket, fixed window, leaky bucket), six storage adapters (memory, Redis, Upstash, Cloudflare KV/D1, Durable Objects), six framework adapters (Hono, Elysia, Express, Fastify, Next.js, SvelteKit). RFC-draft RateLimit-Policy headers from the box.",
+  "license": "MIT",
+  "author": "Mykhailo Kryvytskyi",
+  "homepage": "https://github.com/j09822475-dev/devkit-ratelimit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j09822475-dev/devkit-ratelimit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/j09822475-dev/devkit-ratelimit/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./errors": {
+      "types": "./dist/errors/index.d.ts",
+      "import": "./dist/errors/index.js"
+    },
+    "./algorithms/sliding-window": {
+      "types": "./dist/algorithms/sliding-window/index.d.ts",
+      "import": "./dist/algorithms/sliding-window/index.js"
+    },
+    "./algorithms/sliding-window-log": {
+      "types": "./dist/algorithms/sliding-window-log/index.d.ts",
+      "import": "./dist/algorithms/sliding-window-log/index.js"
+    },
+    "./algorithms/token-bucket": {
+      "types": "./dist/algorithms/token-bucket/index.d.ts",
+      "import": "./dist/algorithms/token-bucket/index.js"
+    },
+    "./algorithms/fixed-window": {
+      "types": "./dist/algorithms/fixed-window/index.d.ts",
+      "import": "./dist/algorithms/fixed-window/index.js"
+    },
+    "./algorithms/leaky-bucket": {
+      "types": "./dist/algorithms/leaky-bucket/index.d.ts",
+      "import": "./dist/algorithms/leaky-bucket/index.js"
+    },
+    "./adapters/memory": {
+      "types": "./dist/adapters/memory/index.d.ts",
+      "import": "./dist/adapters/memory/index.js"
+    },
+    "./adapters/redis": {
+      "types": "./dist/adapters/redis/index.d.ts",
+      "import": "./dist/adapters/redis/index.js"
+    },
+    "./adapters/upstash": {
+      "types": "./dist/adapters/upstash/index.d.ts",
+      "import": "./dist/adapters/upstash/index.js"
+    },
+    "./adapters/cloudflare-kv": {
+      "types": "./dist/adapters/cloudflare-kv/index.d.ts",
+      "import": "./dist/adapters/cloudflare-kv/index.js"
+    },
+    "./adapters/cloudflare-d1": {
+      "types": "./dist/adapters/cloudflare-d1/index.d.ts",
+      "import": "./dist/adapters/cloudflare-d1/index.js"
+    },
+    "./adapters/durable-object": {
+      "types": "./dist/adapters/durable-object/index.d.ts",
+      "import": "./dist/adapters/durable-object/index.js"
+    },
+    "./frameworks/hono": {
+      "types": "./dist/frameworks/hono/index.d.ts",
+      "import": "./dist/frameworks/hono/index.js"
+    },
+    "./frameworks/elysia": {
+      "types": "./dist/frameworks/elysia/index.d.ts",
+      "import": "./dist/frameworks/elysia/index.js"
+    },
+    "./frameworks/express": {
+      "types": "./dist/frameworks/express/index.d.ts",
+      "import": "./dist/frameworks/express/index.js"
+    },
+    "./frameworks/fastify": {
+      "types": "./dist/frameworks/fastify/index.d.ts",
+      "import": "./dist/frameworks/fastify/index.js"
+    },
+    "./frameworks/next": {
+      "types": "./dist/frameworks/next/index.d.ts",
+      "import": "./dist/frameworks/next/index.js"
+    },
+    "./frameworks/sveltekit": {
+      "types": "./dist/frameworks/sveltekit/index.d.ts",
+      "import": "./dist/frameworks/sveltekit/index.js"
+    },
+    "./compose": {
+      "types": "./dist/compose/index.d.ts",
+      "import": "./dist/compose/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "rate-limit",
+    "rate-limiter",
+    "ratelimit",
+    "throttle",
+    "throttling",
+    "edge",
+    "edge-runtime",
+    "cloudflare-workers",
+    "cloudflare-kv",
+    "cloudflare-d1",
+    "durable-objects",
+    "vercel-edge",
+    "deno",
+    "bun",
+    "hono",
+    "elysia",
+    "express",
+    "fastify",
+    "nextjs",
+    "sveltekit",
+    "web-standard",
+    "fetch",
+    "middleware",
+    "sliding-window",
+    "token-bucket",
+    "leaky-bucket",
+    "fixed-window",
+    "ddos-protection",
+    "api-security",
+    "typescript",
+    "type-safe",
+    "zero-dependencies",
+    "express-rate-limit-alternative",
+    "upstash-ratelimit-alternative"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:types": "vitest run --typecheck",
+    "test:coverage": "vitest run --coverage",
+    "bench": "vitest bench",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "size": "size-limit",
+    "publint": "publint",
+    "attw": "attw --pack .",
+    "release": "changeset publish",
+    "prepublishOnly": "npm run build && npm run publint && npm run attw && npm run size"
+  },
+  "peerDependencies": {
+    "@cloudflare/workers-types": ">=4.20240925 <5",
+    "@sveltejs/kit": ">=2 <3",
+    "@upstash/redis": ">=1.34 <2",
+    "elysia": ">=1.1 <2",
+    "express": ">=4 <6",
+    "fastify": ">=4 <6",
+    "hono": ">=4 <5",
+    "next": ">=13.4 <16"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    },
+    "@sveltejs/kit": {
+      "optional": true
+    },
+    "@upstash/redis": {
+      "optional": true
+    },
+    "elysia": {
+      "optional": true
+    },
+    "express": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.16.0",
+    "@biomejs/biome": "^1.9.0",
+    "@changesets/cli": "^2.27.0",
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "@cloudflare/workers-types": "^4.20240925.0",
+    "@size-limit/preset-small-lib": "^11.1.0",
+    "@types/express": "^4.17.0",
+    "@types/node": "^22.0.0",
+    "@upstash/redis": "^1.34.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "elysia": "^1.1.0",
+    "express": "^4.19.0",
+    "fastify": "^4.28.0",
+    "hono": "^4.6.0",
+    "ioredis": "^5.4.0",
+    "ioredis-mock": "^8.9.0",
+    "miniflare": "^3.20240925.0",
+    "msw": "^2.4.0",
+    "next": "^14.2.0",
+    "publint": "^0.2.0",
+    "size-limit": "^11.1.0",
+    "supertest": "^7.0.0",
+    "testcontainers": "^10.13.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  },
+  "size-limit": [
+    {
+      "name": "core",
+      "path": "dist/index.js",
+      "limit": "3.2 KB"
+    },
+    {
+      "name": "errors",
+      "path": "dist/errors/index.js",
+      "limit": "0.4 KB"
+    },
+    {
+      "name": "algorithms/sliding-window",
+      "path": "dist/algorithms/sliding-window/index.js",
+      "limit": "0.5 KB"
+    },
+    {
+      "name": "algorithms/sliding-window-log",
+      "path": "dist/algorithms/sliding-window-log/index.js",
+      "limit": "0.5 KB"
+    },
+    {
+      "name": "algorithms/token-bucket",
+      "path": "dist/algorithms/token-bucket/index.js",
+      "limit": "0.5 KB"
+    },
+    {
+      "name": "algorithms/fixed-window",
+      "path": "dist/algorithms/fixed-window/index.js",
+      "limit": "0.4 KB"
+    },
+    {
+      "name": "algorithms/leaky-bucket",
+      "path": "dist/algorithms/leaky-bucket/index.js",
+      "limit": "0.5 KB"
+    },
+    {
+      "name": "adapters/memory",
+      "path": "dist/adapters/memory/index.js",
+      "limit": "0.8 KB"
+    },
+    {
+      "name": "adapters/redis",
+      "path": "dist/adapters/redis/index.js",
+      "limit": "2 KB"
+    },
+    {
+      "name": "adapters/upstash",
+      "path": "dist/adapters/upstash/index.js",
+      "limit": "1.6 KB"
+    },
+    {
+      "name": "adapters/cloudflare-kv",
+      "path": "dist/adapters/cloudflare-kv/index.js",
+      "limit": "1.2 KB"
+    },
+    {
+      "name": "adapters/cloudflare-d1",
+      "path": "dist/adapters/cloudflare-d1/index.js",
+      "limit": "1.4 KB"
+    },
+    {
+      "name": "adapters/durable-object",
+      "path": "dist/adapters/durable-object/index.js",
+      "limit": "0.9 KB"
+    },
+    {
+      "name": "frameworks/hono",
+      "path": "dist/frameworks/hono/index.js",
+      "limit": "0.4 KB"
+    },
+    {
+      "name": "frameworks/elysia",
+      "path": "dist/frameworks/elysia/index.js",
+      "limit": "0.4 KB"
+    },
+    {
+      "name": "frameworks/express",
+      "path": "dist/frameworks/express/index.js",
+      "limit": "0.7 KB"
+    },
+    {
+      "name": "frameworks/fastify",
+      "path": "dist/frameworks/fastify/index.js",
+      "limit": "0.5 KB"
+    },
+    {
+      "name": "frameworks/next",
+      "path": "dist/frameworks/next/index.js",
+      "limit": "0.7 KB"
+    },
+    {
+      "name": "frameworks/sveltekit",
+      "path": "dist/frameworks/sveltekit/index.js",
+      "limit": "0.5 KB"
+    },
+    {
+      "name": "compose",
+      "path": "dist/compose/index.js",
+      "limit": "0.7 KB"
+    }
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

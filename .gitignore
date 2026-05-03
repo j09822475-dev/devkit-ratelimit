@@ -1,0 +1,54 @@
+# Dependencies
+node_modules
+.pnpm-store
+.yarn
+.pnp.*
+
+# Build output
+dist
+build
+.tsbuildinfo
+*.tsbuildinfo
+
+# Test / coverage
+coverage
+.nyc_output
+.vitest-cache
+
+# Bundler / framework caches
+.cache
+.turbo
+.next
+.nuxt
+.svelte-kit
+.wrangler
+.vercel
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.swp
+*.swo
+
+# Tooling
+.eslintcache
+.size-limit
+.changeset/*-*.md
