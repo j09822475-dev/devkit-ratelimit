@@ -13,8 +13,10 @@
  */
 export function isDev(): boolean {
   // `globalThis.process` may be undefined on Workers / Deno; guard
-  // before reading `env`.
+  // before reading `env`. Production-safe default when `process` is
+  // unavailable — we have no signal that we're in development there.
   const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
-  const env = proc?.env?.['NODE_ENV'];
+  if (proc?.env === undefined) return false;
+  const env = proc.env['NODE_ENV'];
   return env === undefined || env === 'development';
 }
