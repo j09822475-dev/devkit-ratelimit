@@ -440,6 +440,26 @@ The hook receives a single discriminated event with `type ∈ { 'rate-limit.allo
 
 The TL;DR: `@devkit/ratelimit` is the only library in the table that runs on every modern runtime, supports every common algorithm, ships every common store adapter, and locks you into nothing.
 
+## Examples
+
+Five runnable examples live under [`examples/`](./examples). Each is self-contained — clone the repo, then `npx tsx examples/{name}.ts` runs it with no extra setup. A matching StackBlitz sandbox under [`examples/sandbox/`](./examples/sandbox) hosts the same code as a one-click playground.
+
+| Example | What it shows | Sandbox |
+|---|---|---|
+| [`basic-usage`](./examples/basic-usage.ts) | Sliding-window limiter, in-memory store, `check` / `peek` / `reset`, RFC headers | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/devkit-ratelimit/tree/main/examples/sandbox/basic-usage) |
+| [`advanced-usage`](./examples/advanced-usage.ts) | Token-bucket per plan, `tieredRateLimiter` (free/pro/enterprise), `composeAll` per-IP backstop, structured key generator with typed context, observability hook | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/devkit-ratelimit/tree/main/examples/sandbox/advanced-usage) |
+| [`with-hono`](./examples/with-hono.ts) | `honoRateLimit` middleware, driven via `app.fetch(request)` (portable across Workers / Bun / Deno / Node) | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/devkit-ratelimit/tree/main/examples/sandbox/with-hono) |
+| [`with-express`](./examples/with-express.ts) | `expressRateLimit` middleware on a real Express app, token-bucket recovery after sleep | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/devkit-ratelimit/tree/main/examples/sandbox/with-express) |
+| [`with-next`](./examples/with-next.ts) | `withRateLimit(limiter, handler)` wrapping a Next.js App Router Route Handler | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/devkit-ratelimit/tree/main/examples/sandbox/with-next) |
+
+```sh
+git clone https://github.com/j09822475-dev/devkit-ratelimit
+cd devkit-ratelimit
+npm install
+npm run build           # builds the dist/ used by the local examples
+npx tsx examples/basic-usage.ts
+```
+
 ## Contributing
 
 Contributions are welcome — this is a portfolio project and feedback / PRs help it grow.

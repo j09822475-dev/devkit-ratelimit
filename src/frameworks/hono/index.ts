@@ -51,8 +51,19 @@ export function honoRateLimit<K = undefined>(
     // clone is cheap (frozen config swap; no normalisation), and only
     // produced when an executionCtx is actually present. Limiters built
     // without `hookMode: 'wait-until'` see no behaviour change.
+    //
+    // Hono v4 exposes `c.executionCtx` as a *throwing* getter on the
+    // node-server / Bun.serve paths where no `ExecutionContext` is wired
+    // (Workers/Vercel Edge attach one, plain Node does not). Read it via a
+    // try/catch so the middleware survives both code paths.
+    let executionCtx: { waitUntil(p: Promise<unknown>): void } | undefined;
+    try {
+      executionCtx = c.executionCtx;
+    } catch {
+      executionCtx = undefined;
+    }
     const scoped =
-      c.executionCtx !== undefined ? limiter.withExecutionCtx(c.executionCtx) : limiter;
+      executionCtx !== undefined ? limiter.withExecutionCtx(executionCtx) : limiter;
     const result = await scoped.check(c.req.raw);
     c.set('rateLimit', result as unknown);
     if (!result.allowed) {
